@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -40,6 +41,94 @@ from .magnified_modeling import (
 
 
 METRIC_KEYS = ("loss", "native_loss")
+
+
+def stratified_file_indices(
+    signature: list[Mapping[str, Any]], limit: int
+) -> list[int]:
+    """Select a deterministic, approximately equal monitor from every JSONL file."""
+    counts = [int(row["records"]) for row in signature]
+    total = sum(counts)
+    if limit <= 0 or limit >= total:
+        return list(range(total))
+    nonempty = [index for index, count in enumerate(counts) if count > 0]
+    if not nonempty:
+        return []
+
+    allocation = [0] * len(counts)
+    remaining = min(limit, total)
+    while remaining:
+        progressed = False
+        for index in nonempty:
+            if allocation[index] < counts[index] and remaining:
+                allocation[index] += 1
+                remaining -= 1
+                progressed = True
+        if not progressed:
+            break
+
+    offsets = []
+    cursor = 0
+    for count in counts:
+        offsets.append(cursor)
+        cursor += count
+
+    selected = []
+    for offset, count, take in zip(offsets, counts, allocation):
+        if take == 0:
+            continue
+        if take == count:
+            local = list(range(count))
+        else:
+            # Midpoints of equal-width bins cover the complete file without RNG.
+            local = [
+                min(count - 1, ((2 * slot + 1) * count) // (2 * take))
+                for slot in range(take)
+            ]
+        selected.extend(offset + value for value in local)
+    if len(selected) != min(limit, total) or len(set(selected)) != len(selected):
+        raise RuntimeError("Stratified validation selection is not unique and complete")
+    return selected
+
+
+def validation_indices(
+    signature: list[Mapping[str, Any]], limit: int, policy: str
+) -> list[int]:
+    total = sum(int(row["records"]) for row in signature)
+    effective = total if limit <= 0 else min(limit, total)
+    if policy == "first":
+        return list(range(effective))
+    if policy == "stratified_files":
+        return stratified_file_indices(signature, effective)
+    raise ValueError(f"Unknown validation sampling policy: {policy}")
+
+
+def rank_training_indices(
+    records: int,
+    padding: int,
+    seed: int,
+    order: str,
+    rank: int,
+    world_size: int,
+    local_start: int,
+    local_total: int,
+) -> list[int]:
+    if records <= 0 or padding < 0 or padding >= max(1, records):
+        raise ValueError("Invalid training record or padding count")
+    if order == "shuffled":
+        schedule = np.random.default_rng(seed).permutation(records)
+    elif order == "sequential":
+        schedule = np.arange(records, dtype=np.int64)
+    else:
+        raise ValueError(f"Unknown sample order: {order}")
+    if padding:
+        schedule = np.concatenate((schedule, schedule[:padding]))
+    start = rank + local_start * world_size
+    stop = rank + local_total * world_size
+    selected = schedule[start:stop:world_size]
+    if int(selected.size) != local_total - local_start:
+        raise RuntimeError("Per-rank training schedule length is inconsistent")
+    return [int(value) for value in selected]
 
 
 def rank_log(rank: int, message: str) -> None:
@@ -187,10 +276,11 @@ def checkpoint_payload(
     max_steps: int,
     train_signature: list[dict[str, Any]],
     validation_signature: list[dict[str, Any]],
+    init_adapter_signature: dict[str, Any] | None,
     rng_states: list[dict[str, torch.Tensor]] | None,
 ) -> dict[str, Any]:
     return {
-        "schema_version": "pixel-pivr-lora-checkpoint-v2",
+        "schema_version": "pixel-pivr-lora-checkpoint-v3",
         "config": {
             "experiment": str(args.visual_context),
             "base_model": str(args.model.resolve()),
@@ -207,6 +297,10 @@ def checkpoint_payload(
             "max_steps": int(max_steps),
             "world_size": int(world_size),
             "seed": int(args.seed),
+            "validation_sampling": str(args.validation_sampling),
+            "validation_records": int(args.validation_records),
+            "init_adapter": init_adapter_signature,
+            "sample_order": str(args.sample_order),
             "lora_audit": dict(lora_audit),
         },
         "step": int(step),
@@ -229,6 +323,7 @@ def verify_resume_contract(
     max_steps: int,
     train_signature: list[dict[str, Any]],
     validation_signature: list[dict[str, Any]],
+    init_adapter_signature: dict[str, Any] | None,
 ) -> None:
     config = payload.get("config") or {}
     expected = {
@@ -246,6 +341,10 @@ def verify_resume_contract(
         "max_steps": int(max_steps),
         "world_size": int(world_size),
         "seed": int(args.seed),
+        "validation_sampling": str(args.validation_sampling),
+        "validation_records": int(args.validation_records),
+        "init_adapter": init_adapter_signature,
+        "sample_order": str(args.sample_order),
     }
     mismatches = {
         key: {"saved": config.get(key), "requested": value}
@@ -281,6 +380,12 @@ def train(args: argparse.Namespace) -> None:
         rank=rank,
         world_size=world_size,
     )
+    adapter_payload: list[Any] = [None]
+    if rank == 0 and args.init_adapter is not None:
+        adapter_payload[0] = data_signature([args.init_adapter.resolve()])[0]
+    if world_size > 1:
+        dist.broadcast_object_list(adapter_payload, src=0)
+    init_adapter_signature = adapter_payload[0]
     train_records = sum(int(row["records"]) for row in train_signature)
     validation_records = sum(int(row["records"]) for row in validation_signature)
     if args.expected_train_records and train_records != args.expected_train_records:
@@ -438,7 +543,7 @@ def train(args: argparse.Namespace) -> None:
         output.mkdir(parents=True, exist_ok=True)
         signature_path = output / "run_contract.json"
         contract = {
-            "schema_version": "pixel-pivr-run-contract-v1",
+            "schema_version": "pixel-pivr-run-contract-v2",
             "model": str(args.model.resolve()),
             "data_root": str(args.data_root.resolve()),
             "train_data": train_signature,
@@ -454,9 +559,10 @@ def train(args: argparse.Namespace) -> None:
             "visual_context": str(args.visual_context),
             "magnified_roi_pixels": int(args.magnified_roi_pixels),
             "magnified_roi_stride": int(args.magnified_roi_stride),
-            "init_adapter": None
-            if args.init_adapter is None
-            else str(args.init_adapter.resolve()),
+            "init_adapter": init_adapter_signature,
+            "validation_sampling": str(args.validation_sampling),
+            "validation_records": int(args.validation_records),
+            "sample_order": str(args.sample_order),
         }
         if signature_path.exists():
             saved = json.loads(signature_path.read_text(encoding="utf-8"))
@@ -475,8 +581,6 @@ def train(args: argparse.Namespace) -> None:
     if resume.is_file() or resume.is_symlink():
         if args.no_resume:
             raise RuntimeError(f"Output has a checkpoint but --no-resume was set: {resume}")
-        if args.init_adapter is not None:
-            raise RuntimeError("Do not combine --init-adapter with same-run resume")
         payload = torch.load(resume, map_location="cpu", weights_only=False)
         verify_resume_contract(
             payload,
@@ -485,6 +589,7 @@ def train(args: argparse.Namespace) -> None:
             max_steps=max_steps,
             train_signature=train_signature,
             validation_signature=validation_signature,
+            init_adapter_signature=init_adapter_signature,
         )
         restore_trainable_state(model, payload["trainable_state"])
         optimizer.load_state_dict(payload["optimizer_state"])
@@ -513,16 +618,34 @@ def train(args: argparse.Namespace) -> None:
 
     local_total = max_steps * int(args.gradient_accumulation)
     local_start = start_exposure // world_size
-    local_indices = [
-        (rank + local_index * world_size) % len(train_dataset)
-        for local_index in range(local_start, local_total)
-    ]
-    validation_limit = (
-        validation_records
-        if args.validation_records <= 0
-        else min(args.validation_records, validation_records)
+    local_indices = rank_training_indices(
+        train_records,
+        int(args.allowed_padding_records),
+        int(args.seed),
+        str(args.sample_order),
+        rank,
+        world_size,
+        local_start,
+        local_total,
     )
-    validation_indices = list(range(validation_limit))
+    monitor_indices = validation_indices(
+        validation_signature,
+        int(args.validation_records),
+        str(args.validation_sampling),
+    )
+    if rank == 0:
+        atomic_json(
+            output / "validation_monitor.json",
+            {
+                "policy": str(args.validation_sampling),
+                "requested_records": int(args.validation_records),
+                "selected_records": len(monitor_indices),
+                "files": validation_signature,
+                "indices_sha256": hashlib.sha256(
+                    json.dumps(monitor_indices, separators=(",", ":")).encode("utf-8")
+                ).hexdigest(),
+            },
+        )
 
     interrupted = False
 
@@ -539,12 +662,24 @@ def train(args: argparse.Namespace) -> None:
             import wandb
         except ImportError as exc:
             raise RuntimeError("Install pixel-pivr[tracking] to enable W&B") from exc
+        contract_bytes = (output / "run_contract.json").read_bytes()
+        wandb_run_id = args.wandb_run_id or hashlib.sha256(
+            str(output).encode("utf-8") + b"\0" + contract_bytes
+        ).hexdigest()[:24]
         wandb_run = wandb.init(
             project=args.wandb_project,
             name=args.wandb_name or output.name,
             config=json.loads((output / "run_contract.json").read_text(encoding="utf-8")),
             resume="allow",
-            id=args.wandb_run_id,
+            id=wandb_run_id,
+        )
+        atomic_json(
+            output / "wandb.json",
+            {
+                "project": args.wandb_project,
+                "name": args.wandb_name or output.name,
+                "id": wandb_run_id,
+            },
         )
 
     loader = make_loader(train_dataset, local_indices, args.workers)
@@ -578,6 +713,7 @@ def train(args: argparse.Namespace) -> None:
                 max_steps=max_steps,
                 train_signature=train_signature,
                 validation_signature=validation_signature,
+                init_adapter_signature=init_adapter_signature,
                 rng_states=rng_states,
             )
             atomic_torch_save(checkpoint, payload)
@@ -657,7 +793,7 @@ def train(args: argparse.Namespace) -> None:
             validation = validate(
                 wrapper,
                 validation_dataset,
-                validation_indices,
+                monitor_indices,
                 args.workers,
                 rank=rank,
                 world_size=world_size,
@@ -730,6 +866,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-train-records", type=int, default=0)
     parser.add_argument("--expected-validation-records", type=int, default=0)
     parser.add_argument("--validation-records", type=int, default=0)
+    parser.add_argument(
+        "--validation-sampling",
+        choices=("stratified_files", "first"),
+        default="stratified_files",
+        help="Select validation rows evenly across files or from the concatenated prefix",
+    )
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--image-token-limit", type=int, default=1024)
     parser.add_argument("--max-sequence", type=int, default=8192)
@@ -754,6 +896,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=0)
     parser.add_argument("--gradient-accumulation", type=int, default=1)
     parser.add_argument("--allowed-padding-records", type=int, default=0)
+    parser.add_argument(
+        "--sample-order",
+        choices=("shuffled", "sequential"),
+        default="shuffled",
+        help="Deterministic global shuffle is the recommended exact-coverage order",
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import time
 from collections import Counter
@@ -19,6 +20,7 @@ from .geometry import (
     class_nms,
     detection_counts,
     discovery_prompt,
+    hbox_iou,
     parse_labeled_points,
     parse_single_hbb,
     point_address_prompt,
@@ -93,16 +95,92 @@ def normalize_ground_truth(row: Mapping[str, Any]) -> list[dict[str, Any]]:
     return output
 
 
+def pointing_counts(
+    ground_truth: list[dict[str, Any]], points: list[dict[str, Any]]
+) -> tuple[int, int, int]:
+    matched: set[int] = set()
+    true_positive = false_positive = 0
+    for point in points:
+        candidates = [
+            index
+            for index, target in enumerate(ground_truth)
+            if index not in matched
+            and canonical_label(target.get("label")) == canonical_label(point.get("label"))
+            and point_inside_hbox(point["point"], target["hbox"])
+        ]
+        if candidates:
+            matched.add(candidates[0])
+            true_positive += 1
+        else:
+            false_positive += 1
+    return true_positive, false_positive, len(ground_truth) - len(matched)
+
+
+def update_metrics(
+    row: Mapping[str, Any],
+    detection: Counter,
+    pointing: Counter,
+    grounding: Counter,
+) -> None:
+    metric = row.get("metric") or {}
+    task = str(row.get("task") or "detection")
+    if task == "detection" and metric:
+        detection.update(
+            tp=int(metric.get("tp", 0)),
+            fp=int(metric.get("fp", 0)),
+            fn=int(metric.get("fn", 0)),
+        )
+    elif task == "pointing" and metric:
+        pointing.update(
+            tp=int(metric.get("tp", 0)),
+            fp=int(metric.get("fp", 0)),
+            fn=int(metric.get("fn", 0)),
+        )
+    elif task == "grounding" and metric:
+        overlap = float(metric.get("iou", 0.0))
+        grounding.update(
+            queries=1,
+            iou_sum=overlap,
+            acc_0_5=int(overlap >= 0.5),
+            acc_0_7=int(overlap >= 0.7),
+        )
+
+
+def sample_seed(base_seed: int, sample_key: str) -> int:
+    digest = hashlib.sha256(sample_key.encode("utf-8")).digest()
+    return (int(base_seed) + int.from_bytes(digest[:4], "big")) % (2**31)
+
+
 def run(args: argparse.Namespace) -> None:
     if not 1 <= args.wave_size <= 200:
         raise ValueError("--wave-size must be in [1, 200]")
     args.output.mkdir(parents=True, exist_ok=True)
     predictions_path = args.output / "predictions.jsonl"
     execution_path = args.output / "execution.jsonl"
-    if predictions_path.exists() or execution_path.exists():
+    if (predictions_path.exists() or execution_path.exists()) and not args.resume:
         raise FileExistsError(
-            f"Output already contains predictions; choose a new directory: {args.output}"
+            f"Output already contains predictions; choose a new directory or pass --resume: {args.output}"
         )
+
+    processed: set[str] = set()
+    detection_totals: Counter = Counter()
+    pointing_totals: Counter = Counter()
+    grounding_totals: Counter = Counter()
+    tasks_seen: Counter = Counter()
+    if args.resume and predictions_path.is_file():
+        with predictions_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                prior = json.loads(line)
+                sample_key = str(prior["sample_key"])
+                if sample_key in processed:
+                    raise RuntimeError(f"Duplicate prior sample_key: {sample_key}")
+                processed.add(sample_key)
+                tasks_seen[str(prior.get("task") or "detection")] += 1
+                update_metrics(
+                    prior, detection_totals, pointing_totals, grounding_totals
+                )
 
     worker = LocateAnythingPixelPIVRWorker(
         args.model,
@@ -130,15 +208,32 @@ def run(args: argparse.Namespace) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed(args.seed)
 
-    totals = Counter()
     total_point_seconds = 0.0
     total_refinement_seconds = 0.0
+    if args.resume and execution_path.is_file():
+        with execution_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                prior = json.loads(line)
+                total_point_seconds += float(prior.get("point_stage_seconds", 0.0))
+                total_refinement_seconds += float(prior.get("end_to_end_seconds", 0.0))
     with args.manifest.open("r", encoding="utf-8") as handle:
         for index, line in enumerate(handle, 1):
             if not line.strip():
                 raise ValueError(f"Blank manifest line at {index}")
             row = json.loads(line)
             image_id = str(row.get("image_id") or f"row-{index:08d}")
+            sample_key = str(row.get("sample_key") or image_id)
+            if sample_key in processed:
+                continue
+            seed = sample_seed(args.seed, sample_key)
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(seed)
+            task = str(row.get("task") or "detection")
+            if task not in {"detection", "grounding", "pointing"}:
+                raise ValueError(f"Unsupported task {task!r} for {sample_key}")
             image_path = resolve_image(str(row["image"]), args.data_root)
             image = Image.open(image_path).convert("RGB")
             width, height = image.size
@@ -153,7 +248,7 @@ def run(args: argparse.Namespace) -> None:
                 started = time.perf_counter()
                 point_answer = worker.predict_points(
                     image,
-                    discovery_prompt(classes),
+                    str(row.get("point_prompt") or discovery_prompt(classes)),
                     max_new_tokens=args.point_max_new_tokens,
                     temperature=args.temperature,
                     top_p=args.top_p,
@@ -162,6 +257,43 @@ def run(args: argparse.Namespace) -> None:
                 points = parse_labeled_points(point_answer, width, height)
             allowed = set(classes)
             points = [point for point in points if point["label"] in allowed]
+            ground_truth = normalize_ground_truth(
+                {**row, "image_size": [width, height]}
+            )
+
+            if task == "pointing":
+                tp, fp, fn = pointing_counts(ground_truth, points)
+                metric = {"tp": tp, "fp": fp, "fn": fn}
+                output_row = {
+                    "sample_key": sample_key,
+                    "image_id": image_id,
+                    "task": task,
+                    "image": str(image_path),
+                    "classes": classes,
+                    "point_query_output": point_answer,
+                    "points": points,
+                    "predictions": [],
+                    "metric": metric,
+                }
+                append_jsonl(predictions_path, output_row)
+                append_jsonl(
+                    execution_path,
+                    {
+                        "sample_key": sample_key,
+                        "image_id": image_id,
+                        "point_stage_seconds": point_seconds,
+                        "end_to_end_seconds": 0.0,
+                    },
+                )
+                tasks_seen[task] += 1
+                update_metrics(
+                    output_row,
+                    detection_totals,
+                    pointing_totals,
+                    grounding_totals,
+                )
+                total_point_seconds += point_seconds
+                continue
 
             branches: list[AddressedCrop] = []
             tasks: list[dict[str, Any]] = []
@@ -256,30 +388,40 @@ def run(args: argparse.Namespace) -> None:
                     {**task, **result, "accepted": accepted, "prediction": prediction}
                 )
             predictions = class_nms(raw_predictions, args.nms_iou)
-            ground_truth = normalize_ground_truth(
-                {**row, "image_size": [width, height]}
-            )
-            counts = None
-            if "gt" in row:
+            metric = None
+            if task == "detection" and "gt" in row:
                 tp, fp, fn = detection_counts(ground_truth, predictions)
-                totals.update(tp=tp, fp=fp, fn=fn)
-                counts = {"tp": tp, "fp": fp, "fn": fn}
+                metric = {"tp": tp, "fp": fp, "fn": fn}
+            elif task == "grounding":
+                # The official single-object protocol scores the first valid box.
+                prediction = predictions[0] if predictions else None
+                overlap = (
+                    hbox_iou(prediction["hbox"], ground_truth[0]["hbox"])
+                    if prediction is not None and ground_truth
+                    else 0.0
+                )
+                predictions = predictions[:1]
+                metric = {"iou": overlap}
+            output_row = {
+                "sample_key": sample_key,
+                "image_id": image_id,
+                "task": task,
+                "image": str(image_path),
+                "classes": classes,
+                "point_query_output": point_answer,
+                "points": points,
+                "refinements": refinements,
+                "predictions": predictions,
+                "metric": metric,
+            }
             append_jsonl(
                 predictions_path,
-                {
-                    "image_id": image_id,
-                    "image": str(image_path),
-                    "classes": classes,
-                    "point_query_output": point_answer,
-                    "points": points,
-                    "refinements": refinements,
-                    "predictions": predictions,
-                    "counts_iou_0_5": counts,
-                },
+                output_row,
             )
             append_jsonl(
                 execution_path,
                 {
+                    "sample_key": sample_key,
                     "image_id": image_id,
                     "point_stage_seconds": point_seconds,
                     **execution,
@@ -287,6 +429,13 @@ def run(args: argparse.Namespace) -> None:
             )
             total_point_seconds += point_seconds
             total_refinement_seconds += float(execution["end_to_end_seconds"])
+            tasks_seen[task] += 1
+            update_metrics(
+                output_row,
+                detection_totals,
+                pointing_totals,
+                grounding_totals,
+            )
             if index % args.log_every == 0:
                 print(
                     f"images={index} addresses={len(points)} predictions={len(predictions)}",
@@ -307,13 +456,31 @@ def run(args: argparse.Namespace) -> None:
         "magnified_roi_stride": args.magnified_roi_stride,
         "prediction_cap": None,
         "nms_iou": args.nms_iou,
+        "tasks": dict(sorted(tasks_seen.items())),
         "point_stage_seconds": total_point_seconds,
         "refinement_seconds": total_refinement_seconds,
     }
-    if totals:
+    if detection_totals:
         summary["detection_iou_0_5"] = {
-            **dict(totals),
-            **precision_recall_f1(totals["tp"], totals["fp"], totals["fn"]),
+            **dict(detection_totals),
+            **precision_recall_f1(
+                detection_totals["tp"], detection_totals["fp"], detection_totals["fn"]
+            ),
+        }
+    if grounding_totals:
+        queries = int(grounding_totals["queries"])
+        summary["grounding"] = {
+            "queries": queries,
+            "acc_0_5": grounding_totals["acc_0_5"] / queries,
+            "acc_0_7": grounding_totals["acc_0_7"] / queries,
+            "mean_iou": grounding_totals["iou_sum"] / queries,
+        }
+    if pointing_totals:
+        summary["pointing_containment"] = {
+            **dict(pointing_totals),
+            **precision_recall_f1(
+                pointing_totals["tp"], pointing_totals["fp"], pointing_totals["fn"]
+            ),
         }
     atomic_json(args.output / "summary.json", summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
@@ -352,6 +519,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nms-iou", type=float, default=0.5)
     parser.add_argument("--allow-none", action="store_true")
     parser.add_argument("--allow-download", action="store_true")
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=10)
     args = parser.parse_args()

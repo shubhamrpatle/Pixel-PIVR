@@ -46,7 +46,13 @@ def main() -> None:
         ROOT / "reference/release_verification.json",
         ROOT / "reference/magnified_preprojector_verification.json",
         ROOT / "scripts/train_distributed.sh",
+        ROOT / "scripts/bootstrap_machine.sh",
+        ROOT / "scripts/run_full_pipeline.sh",
+        ROOT / "scripts/evaluate_all.sh",
         ROOT / "tools/build_asset_manifest.py",
+        ROOT / "tools/preflight.py",
+        ROOT / "tools/prepare_evaluation.py",
+        ROOT / "tools/source_manifest.py",
         SRC / "train.py",
         SRC / "decoder.py",
         SRC / "audit.py",
@@ -55,6 +61,7 @@ def main() -> None:
         SRC / "magnified_modeling.py",
         SRC / "magnified_decoder.py",
         ROOT / "configs/magnified_preprojector_16k.env.example",
+        ROOT / "configs/full_scale.env.example",
         ROOT / "docs/MAGNIFIED_PREPROJECTOR.md",
     ]
     missing = [str(path) for path in required if not path.is_file()]
@@ -107,9 +114,9 @@ def main() -> None:
         "token_ids_exactly_match_repeated_processor_path"
     ] is True
 
-    shell = ROOT / "scripts/train_distributed.sh"
-    if not os.access(shell, os.X_OK):
-        raise RuntimeError(f"Launcher is not executable: {shell}")
+    for shell in sorted((ROOT / "scripts").glob("*.sh")):
+        if not os.access(shell, os.X_OK):
+            raise RuntimeError(f"Launcher is not executable: {shell}")
     print(
         json.dumps(
             {

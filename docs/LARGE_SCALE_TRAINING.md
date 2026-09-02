@@ -31,9 +31,25 @@ global records/update = W * A
 one-pass optimizer steps = N / (W * A)
 ```
 
-With `MAX_STEPS=0`, the launcher derives this value and refuses to start unless it
-is integral. Padding is never implicit. Set `ALLOWED_PADDING_RECORDS` only when a
-small, explicitly recorded repeat is scientifically acceptable.
+With `MAX_STEPS=0`, the launcher derives this value. `ALLOWED_PADDING_RECORDS=auto`
+adds only the minimum deterministic wrap-around needed to make a complete global
+batch and records that count in `run_contract.json` and `done.json`. For the
+published portable corpus at global batch four, this is two repeated rows in
+Stage 1 and three in Stage 2; no source row is dropped.
+
+`SAMPLE_ORDER=shuffled` creates one deterministic global permutation from the
+run seed before distributing positions across ranks. This interleaves task and
+round shards while preserving exactly-once coverage. The permutation is
+reconstructed from the signed seed and the saved exposure on resume, so it does
+not need to be stored in every checkpoint.
+
+## Validation monitor
+
+The full validation pool has 95,740 records and is deliberately not used for
+gradient updates. `VALIDATION_RECORDS=1000` with
+`VALIDATION_SAMPLING=stratified_files` selects 200 deterministic, evenly spaced
+rows from each of the five task/round files. The exact selected-index digest is
+written to `validation_monitor.json` and is part of the resume contract.
 
 ## Resume
 
@@ -47,9 +63,11 @@ Every checkpoint stores:
 - SHA256, byte size, and line count for every train/validation JSONL;
 - model and data-root paths.
 
-Rerunning the identical command resumes `last.pt`. Changing world size, data,
-schedule, seed, model, image-token limit, or sequence limit is rejected. SIGINT or
-SIGTERM requests a checkpoint at the next aligned optimizer boundary.
+Rerunning the identical command resumes `last.pt`, including Stage 2 runs that
+were initialized from Stage 1 `best.pt`. Changing world size, data, validation
+selection, schedule, seed, model, image-token limit, or sequence limit is
+rejected. SIGINT or SIGTERM requests a checkpoint at the next aligned optimizer
+boundary.
 
 ## Stage 2
 

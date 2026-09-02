@@ -1,9 +1,9 @@
 # Standalone Inference Manifest
 
-Each line identifies one image and the explicitly queried classes:
+Each line identifies one sample, task, image, and explicitly queried classes:
 
 ```json
-{"image_id":"scene-1","image":"images/scene-1.png","classes":["ship","vehicle"]}
+{"sample_key":"dota:1","task":"detection","image_id":"scene-1","image":"images/scene-1.png","classes":["ship","vehicle"]}
 ```
 
 Pixel-PIVR first generates typed points, then refines only those points. To reuse a
@@ -24,6 +24,16 @@ metrics:
 
 The evaluator applies no prediction cap. It retains only HBBs containing their
 address point and then applies class-wise NMS.
+
+Grounding rows set `task` to `grounding`, use the phrase itself as the single
+reference in `classes`, and provide the exact Round-1 point prompt through
+`point_prompt`. The official single-object summary reports first-box Acc@0.5,
+Acc@0.7, and mIoU. Pointing rows set `task` to `pointing`; refinement is skipped
+and points are matched one-to-one by containment in same-class GT HBBs.
+
+`tools/prepare_evaluation.py` builds all five manifests from the portable HF
+package. `scripts/evaluate_all.sh` schedules them over the configured GPUs and
+uses `--resume`, so already written sample keys are not recomputed.
 
 For single-encode magnified local features, use
 `--visual-context preprojector_magnified_roi`. In this mode the point and decoded

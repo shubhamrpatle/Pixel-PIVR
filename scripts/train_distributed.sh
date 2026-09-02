@@ -17,7 +17,7 @@ source "$RUN_CONFIG"
 set +a
 
 required=(
-  PYTHON_BIN MODEL_PATH EAGLE_ROOT DATA_ROOT TRAIN_DATA VALIDATION_DATA
+  PYTHON_BIN MODEL_PATH EAGLE_ROOT DATA_ROOT
   OUTPUT_DIR SMOKE_DIR GPU_IDS GLOBAL_BATCH
 )
 for name in "${required[@]}"; do
@@ -26,10 +26,78 @@ for name in "${required[@]}"; do
     exit 2
   fi
 done
-for path in "$PYTHON_BIN" "$MODEL_PATH" "$EAGLE_ROOT" "$DATA_ROOT" \
-  "$TRAIN_DATA" "$VALIDATION_DATA"; do
+for path in "$PYTHON_BIN" "$MODEL_PATH" "$EAGLE_ROOT" "$DATA_ROOT"; do
   [[ -e "$path" ]] || { echo "Missing configured path: $path" >&2; exit 2; }
 done
+
+load_recipe_annotations() {
+  local recipe="$1"
+  "$PYTHON_BIN" - "$recipe" "$DATA_ROOT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+recipe = Path(sys.argv[1])
+root = Path(sys.argv[2])
+payload = json.loads(recipe.read_text(encoding="utf-8"))
+paths = payload.get("annotation")
+if not isinstance(paths, list) or not paths:
+    raise SystemExit(f"Recipe must contain a non-empty annotation list: {recipe}")
+for value in paths:
+    path = Path(value)
+    print(path if path.is_absolute() else root / path)
+PY
+}
+
+if [[ -n "${TRAIN_RECIPE:-}" ]]; then
+  [[ -f "$TRAIN_RECIPE" ]] || { echo "Missing TRAIN_RECIPE: $TRAIN_RECIPE" >&2; exit 2; }
+  mapfile -t TRAIN_DATA_ARGS < <(load_recipe_annotations "$TRAIN_RECIPE")
+elif [[ -n "${TRAIN_DATA:-}" ]]; then
+  IFS=':' read -r -a TRAIN_DATA_ARGS <<< "$TRAIN_DATA"
+else
+  echo "Set TRAIN_RECIPE or TRAIN_DATA" >&2
+  exit 2
+fi
+
+if [[ -n "${VALIDATION_RECIPE:-}" ]]; then
+  [[ -f "$VALIDATION_RECIPE" ]] || { echo "Missing VALIDATION_RECIPE: $VALIDATION_RECIPE" >&2; exit 2; }
+  mapfile -t VALIDATION_DATA_ARGS < <(load_recipe_annotations "$VALIDATION_RECIPE")
+elif [[ -n "${VALIDATION_DATA:-}" ]]; then
+  IFS=':' read -r -a VALIDATION_DATA_ARGS <<< "$VALIDATION_DATA"
+else
+  echo "Set VALIDATION_RECIPE or VALIDATION_DATA" >&2
+  exit 2
+fi
+
+for path in "${TRAIN_DATA_ARGS[@]}" "${VALIDATION_DATA_ARGS[@]}"; do
+  [[ -f "$path" ]] || { echo "Missing annotation shard: $path" >&2; exit 2; }
+done
+
+count_records() {
+  "$PYTHON_BIN" - "$@" <<'PY'
+import sys
+from pathlib import Path
+
+total = 0
+for value in sys.argv[1:]:
+    with Path(value).open("rb") as handle:
+        total += sum(1 for line in handle if line.strip())
+print(total)
+PY
+}
+
+TRAIN_RECORDS="$(count_records "${TRAIN_DATA_ARGS[@]}")"
+VALIDATION_RECORD_COUNT="$(count_records "${VALIDATION_DATA_ARGS[@]}")"
+if [[ "${EXPECTED_TRAIN_RECORDS:-0}" != "0" && \
+      "$TRAIN_RECORDS" != "$EXPECTED_TRAIN_RECORDS" ]]; then
+  echo "Train count changed: $TRAIN_RECORDS != $EXPECTED_TRAIN_RECORDS" >&2
+  exit 2
+fi
+if [[ "${EXPECTED_VALIDATION_RECORDS:-0}" != "0" && \
+      "$VALIDATION_RECORD_COUNT" != "$EXPECTED_VALIDATION_RECORDS" ]]; then
+  echo "Validation count changed: $VALIDATION_RECORD_COUNT != $EXPECTED_VALIDATION_RECORDS" >&2
+  exit 2
+fi
 
 IFS=',' read -r -a GPUS <<< "$GPU_IDS"
 WORLD_SIZE="${#GPUS[@]}"
@@ -38,6 +106,14 @@ if (( WORLD_SIZE < 1 || GLOBAL_BATCH % WORLD_SIZE != 0 )); then
   exit 2
 fi
 GRADIENT_ACCUMULATION=$((GLOBAL_BATCH / WORLD_SIZE))
+PADDING_RECORDS="${ALLOWED_PADDING_RECORDS:-auto}"
+if [[ "$PADDING_RECORDS" == "auto" ]]; then
+  PADDING_RECORDS=$(( (GLOBAL_BATCH - TRAIN_RECORDS % GLOBAL_BATCH) % GLOBAL_BATCH ))
+elif [[ ! "$PADDING_RECORDS" =~ ^[0-9]+$ ]]; then
+  echo "ALLOWED_PADDING_RECORDS must be auto or a non-negative integer" >&2
+  exit 2
+fi
+ONE_PASS_STEPS=$(( (TRAIN_RECORDS + PADDING_RECORDS) / GLOBAL_BATCH ))
 
 export PYTHONPATH="$ROOT/src:$EAGLE_ROOT:${PYTHONPATH:-}"
 export LOCANY_STRICT_COVERAGE=1
@@ -77,8 +153,8 @@ common_args() {
     --model "$MODEL_PATH"
     --eagle-root "$EAGLE_ROOT"
     --data-root "$DATA_ROOT"
-    --train-data "$TRAIN_DATA"
-    --validation-data "$VALIDATION_DATA"
+    --train-data "${TRAIN_DATA_ARGS[@]}"
+    --validation-data "${VALIDATION_DATA_ARGS[@]}"
     --expected-train-records "${EXPECTED_TRAIN_RECORDS:-0}"
     --expected-validation-records "${EXPECTED_VALIDATION_RECORDS:-0}"
     --lora-rank "${LORA_RANK:-16}"
@@ -88,11 +164,13 @@ common_args() {
     --magnified-roi-pixels "${MAGNIFIED_ROI_PIXELS:-380}"
     --magnified-roi-stride "${MAGNIFIED_ROI_STRIDE:-1}"
     --gradient-accumulation "$GRADIENT_ACCUMULATION"
-    --allowed-padding-records "${ALLOWED_PADDING_RECORDS:-0}"
+    --allowed-padding-records "$PADDING_RECORDS"
+    --sample-order "${SAMPLE_ORDER:-shuffled}"
     --learning-rate "${LEARNING_RATE:-1e-5}"
     --checkpoint-steps "${CHECKPOINT_STEPS:-500}"
     --eval-steps "${EVAL_STEPS:-500}"
     --validation-records "${VALIDATION_RECORDS:-0}"
+    --validation-sampling "${VALIDATION_SAMPLING:-stratified_files}"
     --workers "${WORKERS:-2}"
     --seed "${SEED:-20260901}"
     --vision-attention "${VISION_ATTENTION:-auto}"
@@ -131,7 +209,7 @@ run_torch() {
 case "$MODE" in
   audit)
     AUDIT_ARGS=(
-      --jsonl "$TRAIN_DATA" "$VALIDATION_DATA" \
+      --jsonl "${TRAIN_DATA_ARGS[@]}" "${VALIDATION_DATA_ARGS[@]}" \
       --data-root "$DATA_ROOT" \
       --report "${AUDIT_REPORT:-$ROOT/runs/magnified_preprojector_audit.json}" \
       --exact-loader \
@@ -157,6 +235,8 @@ case "$MODE" in
     require_gpus_free
     echo "Pixel-PIVR inputs are present; $WORLD_SIZE GPUs are free."
     echo "Global records/update: $GLOBAL_BATCH; accumulation/rank: $GRADIENT_ACCUMULATION"
+    echo "Train records: $TRAIN_RECORDS; explicit padding: $PADDING_RECORDS; one-pass steps: $ONE_PASS_STEPS"
+    echo "Validation records: $VALIDATION_RECORD_COUNT; monitor: ${VALIDATION_RECORDS:-0} (${VALIDATION_SAMPLING:-stratified_files})"
     ;;
   smoke)
     require_gpus_free
