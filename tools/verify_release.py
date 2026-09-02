@@ -46,6 +46,7 @@ def main() -> None:
         ROOT / "reference/release_verification.json",
         ROOT / "reference/magnified_preprojector_verification.json",
         ROOT / "scripts/train_distributed.sh",
+        ROOT / "tools/build_asset_manifest.py",
         SRC / "train.py",
         SRC / "decoder.py",
         SRC / "audit.py",

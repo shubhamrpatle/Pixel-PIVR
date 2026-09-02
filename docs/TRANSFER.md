@@ -19,6 +19,7 @@ tar --exclude='Pixel-PIVR/.git' \
     --exclude='*.pyc' \
     --exclude='Pixel-PIVR/.cache' \
     --exclude='Pixel-PIVR/runs' \
+    --exclude='Pixel-PIVR/configs/*.env' \
     -czf Pixel-PIVR-source.tar.gz Pixel-PIVR
 sha256sum Pixel-PIVR-source.tar.gz > Pixel-PIVR-source.tar.gz.sha256
 ```
@@ -53,15 +54,32 @@ and cite them separately.
 
 ## Data And Checkpoints
 
-Use `rsync` with partial-transfer support for large private assets:
+The 16K magnified experiment needs the JSONL records, every referenced image,
+LocateAnything checkpoint, Eagle loader, and benchmark holdout hash list. Build a
+minimal file list from the source workspace:
 
 ```bash
-rsync -ahP --partial --append-verify /source/train.jsonl user@host:/data/pixel_pivr/
-rsync -ahP --partial --append-verify /source/images/ user@host:/data/pixel_pivr/images/
-rsync -ahP --partial --append-verify /source/LocateAnything-3B/ user@host:/models/LocateAnything-3B/
+python tools/build_asset_manifest.py \
+  --data-root /source/workspace \
+  --dataset-dir /source/workspace/path/to/pivr_cached_projected_roi_4k_v1 \
+  --model /source/workspace/path/to/LocateAnything-3B \
+  --eagle-root /source/workspace/path/to/Eagle/Embodied \
+  --holdout-hashes /source/workspace/path/to/all_benchmark_eval_image_sha256.txt \
+  --output-list /tmp/pixel_pivr_assets.txt \
+  --report /tmp/pixel_pivr_assets.json
+```
+
+Transfer exactly those files while preserving their paths relative to
+`--data-root`:
+
+```bash
+rsync -ahP -s --partial --append-verify \
+  --files-from=/tmp/pixel_pivr_assets.txt \
+  /source/workspace/ user@host:/destination/workspace/
 ```
 
 After transfer, run `pixel-pivr-audit` on the destination and compare the JSONL
 SHA256 values in its report with the source report. Then populate
 `configs/large_scale.env` and run `check`, `smoke`, and finally `train` in that
-order.
+order. Do not publish these assets until the licenses and redistribution terms of
+each source dataset and LocateAnything checkpoint have been checked.
