@@ -1,0 +1,39 @@
+{
+  "data_audit": {
+    "errors": 0,
+    "exact_loader_records_checked": 32,
+    "global_point_discovery_records": 10250,
+    "max_post_mtp_tokens_in_exact_sample": 633,
+    "point_indexed_visual_reentry_records": 6750,
+    "sequence_budget": 8192,
+    "status": "passed",
+    "train_records": 16000,
+    "train_sha256": "fd884e67c0666360a1375a3309c2c6e93605bf6860d0e819ebf79f06bc8e9925",
+    "validation_records": 1000,
+    "validation_sha256": "0f251a1c50fee037690e9e0392c96e6fdddf8920918c27860c147d1633f4bb44"
+  },
+  "distributed_training_smoke": {
+    "best_and_last_written": true,
+    "finite_training_steps": 2,
+    "global_record_batch": 4,
+    "peak_gpu_memory_mib": 12901.26318359375,
+    "record_exposures": 8,
+    "rerun_detected_completion": true,
+    "status": "passed",
+    "world_size": 2
+  },
+  "inference_smoke": {
+    "addresses": 2,
+    "geometry": "HBB PBD6",
+    "outputs": 2,
+    "refinement_seconds": 0.8470665290951729,
+    "status": "passed",
+    "wave_size": 2
+  },
+  "release_date": "2026-09-01",
+  "scope": "LocateAnything-3B HBB Pixel-PIVR with Qwen LoRA",
+  "unit_tests": {
+    "passed": 9,
+    "status": "passed"
+  }
+}

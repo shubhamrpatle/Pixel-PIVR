@@ -1,0 +1,74 @@
+{
+  "schema_version": "pixel-pivr-magnified-preprojector-verification-v1",
+  "status": "passed",
+  "mechanism": {
+    "global_image_token_limit": 6000,
+    "moonvit_encodes_per_image": 1,
+    "moonvit_hidden_size": 1152,
+    "projector_input_size": 4608,
+    "projector_output_size": 2048,
+    "requested_roi_pixels": 380,
+    "effective_roi_pixels": 378,
+    "roi_patch_grid": [27, 27],
+    "roi_projector_grid": [26, 26],
+    "roi_stride": 1,
+    "local_visual_tokens": 676
+  },
+  "data_audit": {
+    "status": "passed",
+    "records": 17000,
+    "training_records": 16000,
+    "validation_records": 1000,
+    "global_point_records": 10250,
+    "point_reentry_records": 6750,
+    "unique_image_hashes": 17000,
+    "benchmark_holdout_hashes": 30222,
+    "benchmark_holdout_overlap": 0,
+    "errors": 0,
+    "training_sha256": "6aad170167d4c8f947f388cdfcefac44b3c14eb2c4eeeaa8df53627c3414d339",
+    "validation_sha256": "ede5a648df99c4107ed33ff1d0adb6e17bfaaba146491f59e35001679bcdce10"
+  },
+  "exact_loader_smoke": {
+    "status": "passed",
+    "records": 8,
+    "point_reentry_records": 3,
+    "maximum_augmented_sequence_tokens": 2131,
+    "maximum_sequence_tokens": 8192
+  },
+  "native_global_path_equivalence": {
+    "status": "passed",
+    "projected_shape": [1369, 2048],
+    "maximum_absolute_difference": 0.0,
+    "exact_equal": true
+  },
+  "training_smoke": {
+    "status": "passed",
+    "optimizer_steps": 3,
+    "includes_point_reentry_backward": true,
+    "finite_losses": [1.255466341972351, 0.6776120066642761, 1.3040307760238647],
+    "validation_native_loss": 1.069330592950185,
+    "peak_gpu_mb": 19675.2314453125
+  },
+  "inference_smoke": {
+    "status": "passed",
+    "images": 1,
+    "addresses": 2,
+    "prefix_cache_mode": "shared",
+    "wave_size": 2,
+    "global_image_preprocess_count": 1,
+    "global_moonvit_encodes": 1,
+    "local_moonvit_encodes": 0,
+    "qwen_global_prefix_forwards": 1,
+    "local_visual_tokens_per_address": 676,
+    "note": "Execution-path smoke only; the three-step adapter is not an accuracy result."
+  },
+  "wave_input_deduplication": {
+    "status": "passed",
+    "addresses_checked": 3,
+    "token_ids_exactly_match_repeated_processor_path": true,
+    "attention_masks_exactly_match_repeated_processor_path": true,
+    "global_patch_tensors_before": 3,
+    "global_patch_tensors_after": 1
+  },
+  "claim_boundary": "Implementation and execution are verified. Accuracy improvement over controls has not been established."
+}

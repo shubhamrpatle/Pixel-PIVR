@@ -1,0 +1,44 @@
+{
+  "benchmark": "DOTAv2 Balanced-100",
+  "evaluation": {
+    "gt_instances": 9045,
+    "images": 100,
+    "iou_threshold": 0.5,
+    "matching": "class-aware one-to-one greedy",
+    "nms_iou": 0.5,
+    "prediction_cap": null
+  },
+  "pixel_pivr": {
+    "seed": 20260901,
+    "selected_step": 3500,
+    "sequential": {
+      "f1": 0.10693,
+      "false_negatives": 8481,
+      "false_positives": 940,
+      "precision": 0.3750,
+      "recall": 0.0624,
+      "true_positives": 564
+    },
+    "wave200": {
+      "f1": 0.10600,
+      "false_negatives": 8486,
+      "false_positives": 943,
+      "maximum_exercised_wave": 135,
+      "precision": 0.3722,
+      "recall": 0.0618,
+      "true_positives": 559
+    }
+  },
+  "training": {
+    "global_batch": 4,
+    "global_point_records": 9646,
+    "image_token_limit": 1024,
+    "lora_alpha": 32,
+    "lora_rank": 16,
+    "max_sequence": 8192,
+    "optimizer_steps": 4000,
+    "pixel_reentry_records": 6354,
+    "records": 16000
+  }
+}
+

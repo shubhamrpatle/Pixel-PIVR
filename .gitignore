@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+build/
+dist/
+
+# Models, data, checkpoints, and experiment outputs are intentionally external.
+data/
+checkpoints/
+outputs/
+runs/
+wandb/
+*.pt
+*.pth
+*.safetensors
+
+# Machine-local launch files; commit only the documented *.env.example files.
+configs/*.env

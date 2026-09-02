@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pixel-pivr"
+version = "0.3.0"
+description = "Point-indexed visual re-entry with pixel and pre-projector magnified context"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.5,<2.6",
+  "transformers>=4.57,<4.58",
+  "peft>=0.12,<0.13",
+  "numpy>=1.26,<2",
+  "Pillow>=11,<12",
+]
+
+[project.optional-dependencies]
+tracking = ["wandb>=0.27,<0.28"]
+test = ["pytest>=8,<9"]
+
+[project.scripts]
+pixel-pivr-audit = "pixel_pivr.audit:main"
+pixel-pivr-infer = "pixel_pivr.infer:main"
+pixel-pivr-train = "pixel_pivr.train:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
