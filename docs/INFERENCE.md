@@ -23,7 +23,11 @@ metrics:
 ```
 
 The evaluator applies no prediction cap. It retains only HBBs containing their
-address point and then applies class-wise NMS.
+address point and then applies class-wise NMS. In the release configuration, a
+local None, invalid/non-containing box, or box within two pixels of the crop edge
+triggers one global point-to-box retry. The training corpus contains a paired
+global row for every GT condition that invokes this policy, including complete
+local boxes inside that safety margin.
 
 Grounding rows set `task` to `grounding`, use the phrase itself as the single
 reference in `classes`, and provide the exact Round-1 point prompt through
@@ -35,18 +39,29 @@ and points are matched one-to-one by containment in same-class GT HBBs.
 package. `scripts/evaluate_all.sh` schedules them over the configured GPUs and
 uses `--resume`, so already written sample keys are not recomputed.
 
-For single-encode magnified local features, use
-`--visual-context preprojector_magnified_roi`. In this mode the point and decoded
-HBB remain in full-image coordinates; `--crop-side` is ignored. The 380-pixel
-request maps to a 378-pixel pre-merge MoonViT field and 676 stride-1 local tokens.
+Detection uses each benchmark's original label ontology. In particular, DOTAv2
+retains `plane`, `small vehicle`, and `large vehicle` as three distinct labels,
+and DIOR retains `overpass`; the package's cross-dataset convenience
+`class_name` field is not used for scoring. Model-facing names are signed
+separately, so DIOR asks for `ground track field` while scoring the official
+`groundtrackfield` label. The unambiguous DOTAv2 `airplane -> plane` alias is
+accepted, but generic `vehicle` is not assigned to either vehicle subclass.
+Preflight reconstructs both detection manifests and rejects missing, collapsed,
+unknown, or inconsistently prompted labels.
+
+The release mode is `--visual-context pixel_reencoded --crop-side 144
+--local-resize-side 384`. Each point receives a real 144 x 144 source-pixel crop
+resized to 384 x 384. The local PBD6 box is decoded in the local frame and mapped
+back to the global image. `preprojector_magnified_roi` remains an ablation and is
+not interchangeable with the release adapter.
 
 ## Shared-prefix waves
 
 `--prefix-cache-mode shared` is the default. The global image passes through
-MoonViT/projector and the Qwen prefix once per image. Each point contributes a
-local visual/text suffix, and each branch emits one PBD6 geometry block. A wave
-size is an execution bound, not an object-count cap: 1,000 addresses with
-`--wave-size 200` execute as five waves.
+MoonViT/projector and the Qwen prefix once per image. Local crops are encoded in
+bounded batches, each point contributes a local visual/text suffix, and each
+branch emits one PBD6 geometry block. A wave size is an execution bound, not an
+object-count cap: 1,000 addresses with `--wave-size 200` execute as five waves.
 
 ```bash
 pixel-pivr-infer \
@@ -54,6 +69,12 @@ pixel-pivr-infer \
   --adapter /path/to/best.pt \
   --manifest /path/eval.jsonl \
   --output /path/shared-wave-output \
+  --visual-context pixel_reencoded \
+  --crop-side 144 \
+  --local-resize-side 384 \
+  --geometry-prefix-mode box_only \
+  --global-fallback \
+  --allow-none \
   --prefix-cache-mode shared \
   --wave-size 200
 ```

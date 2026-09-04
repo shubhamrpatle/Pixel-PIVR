@@ -39,6 +39,7 @@ class PixelPIVRWaveDecoder:
         *,
         image_token_limit: int = 1024,
         prefix_cache_mode: str = "shared",
+        geometry_prefix_mode: str = "ref",
     ) -> None:
         self.worker = worker
         self.model = worker.model
@@ -56,6 +57,9 @@ class PixelPIVRWaveDecoder:
         if prefix_cache_mode not in {"recompute", "shared"}:
             raise ValueError("prefix_cache_mode must be recompute or shared")
         self.prefix_cache_mode = prefix_cache_mode
+        if geometry_prefix_mode not in {"ref", "box_only"}:
+            raise ValueError("geometry_prefix_mode must be ref or box_only")
+        self.geometry_prefix_mode = geometry_prefix_mode
         self.image_end_id = int(
             self.tokenizer.convert_tokens_to_ids(self.processor.image_end_token)
         )
@@ -63,14 +67,14 @@ class PixelPIVRWaveDecoder:
     def _messages(
         self, global_image: Any, branch: AddressedCrop
     ) -> list[dict[str, Any]]:
+        content = [{"type": "image", "image": global_image}]
+        if branch.crop is not None:
+            content.append({"type": "image", "image": branch.crop})
+        content.append({"type": "text", "text": branch.question})
         return [
             {
                 "role": "user",
-                "content": [
-                    {"type": "image", "image": global_image},
-                    {"type": "image", "image": branch.crop},
-                    {"type": "text", "text": branch.question},
-                ],
+                "content": content,
             }
         ]
 
@@ -93,7 +97,10 @@ class PixelPIVRWaveDecoder:
             padding=True,
         )
         lengths = image_patch_lengths(inputs["image_grid_hws"])
-        expected_images = 2 * len(branches)
+        local_modes = {branch.crop is not None for branch in branches}
+        if len(local_modes) != 1:
+            raise RuntimeError("One wave cannot mix local and global-only branches")
+        expected_images = len(branches) * (2 if next(iter(local_modes)) else 1)
         if len(lengths) != expected_images:
             raise RuntimeError(
                 f"Expected {expected_images} global/local images, found {len(lengths)}"
@@ -105,11 +112,27 @@ class PixelPIVRWaveDecoder:
         inputs: Mapping[str, Any],
         patch_lengths: Sequence[int],
         cached_global: torch.Tensor | None,
+        branches: Sequence[AddressedCrop],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         pixels = inputs["pixel_values"]
         chunks = list(torch.split(pixels, list(patch_lengths), dim=0))
         grids = torch.as_tensor(inputs["image_grid_hws"], dtype=torch.int32)
-        if len(chunks) % 2:
+        has_local = branches[0].crop is not None
+        if not has_local:
+            if len(chunks) != len(branches):
+                raise RuntimeError("Global-only image/branch count differs")
+            if cached_global is None:
+                features = self.model.extract_feature(
+                    chunks[0].to(device=self.device, dtype=self.dtype),
+                    grids[0:1].to(device=self.device),
+                )
+                projected_global = self.model.mlp1(features[0])
+            else:
+                projected_global = cached_global
+            return projected_global, torch.cat(
+                [projected_global for _ in branches], dim=0
+            )
+        if len(chunks) != 2 * len(branches):
             raise RuntimeError("Global/local image list is not paired")
 
         local_chunks = chunks[1::2]
@@ -143,11 +166,26 @@ class PixelPIVRWaveDecoder:
         inputs: Mapping[str, Any],
         patch_lengths: Sequence[int],
         cached_global: torch.Tensor | None,
+        branches: Sequence[AddressedCrop],
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         pixels = inputs["pixel_values"]
         chunks = list(torch.split(pixels, list(patch_lengths), dim=0))
         grids = torch.as_tensor(inputs["image_grid_hws"], dtype=torch.int32)
-        if len(chunks) % 2:
+        has_local = branches[0].crop is not None
+        if not has_local:
+            if len(chunks) != len(branches):
+                raise RuntimeError("Global-only image/branch count differs")
+            if cached_global is None:
+                features = self.model.extract_feature(
+                    chunks[0].to(device=self.device, dtype=self.dtype),
+                    grids[0:1].to(device=self.device),
+                )
+                projected_global = self.model.mlp1(features[0])
+            else:
+                projected_global = cached_global
+            empty = projected_global.new_empty((0, int(projected_global.shape[-1])))
+            return projected_global, [empty for _ in branches]
+        if len(chunks) != 2 * len(branches):
             raise RuntimeError("Global/local image list is not paired")
         global_grids = grids[0::2]
         first_grid = global_grids[0]
@@ -248,7 +286,30 @@ class PixelPIVRWaveDecoder:
         input_dtype: torch.dtype,
         attention_dtype: torch.dtype,
         device: torch.device,
+        prompt_last_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.geometry_prefix_mode == "box_only":
+            if prompt_last_ids is None or tuple(prompt_last_ids.shape) != (len(branches),):
+                raise RuntimeError("Box-only PBD6 requires one prompt-final token per branch")
+            geometry_ids = torch.cat(
+                (
+                    prompt_last_ids.to(device=device, dtype=input_dtype).unsqueeze(1),
+                    torch.full(
+                        (len(branches), self.n_future_tokens - 1),
+                        self.mask_id,
+                        dtype=input_dtype,
+                        device=device,
+                    ),
+                ),
+                dim=1,
+            )
+            geometry_attention = torch.ones(
+                (len(branches), self.n_future_tokens),
+                dtype=attention_dtype,
+                device=device,
+            )
+            return geometry_ids, geometry_attention
+
         reference_rows = [
             self.tokenizer.encode(f"<ref>{branch.label}</ref>", add_special_tokens=False)
             for branch in branches
@@ -436,6 +497,7 @@ class PixelPIVRWaveDecoder:
             input_dtype=suffix_ids.dtype,
             attention_dtype=suffix_attention.dtype,
             device=suffix_ids.device,
+            prompt_last_ids=suffix_ids[:, -1],
         )
         full_attention = torch.cat((context_attention, geometry_attention), dim=1)
         positions = full_attention.long().cumsum(-1) - 1
@@ -487,55 +549,12 @@ class PixelPIVRWaveDecoder:
             return_dict=True,
         )
 
-        reference_rows = [
-            self.tokenizer.encode(
-                f"<ref>{branch.label}</ref>", add_special_tokens=False
-            )
-            for branch in branches
-        ]
-        if any(not row for row in reference_rows):
-            raise RuntimeError("A point-address reference tokenized to an empty sequence")
-        maximum_reference = max(len(row) for row in reference_rows)
-        pad_id = int(
-            self.tokenizer.pad_token_id
-            if self.tokenizer.pad_token_id is not None
-            else self.tokenizer.eos_token_id
-        )
-        reference_ids = torch.full(
-            (batch_size, maximum_reference),
-            pad_id,
-            dtype=input_ids.dtype,
+        geometry_ids, geometry_attention = self._prepare_geometry_inputs(
+            branches,
+            input_dtype=input_ids.dtype,
+            attention_dtype=attention_mask.dtype,
             device=input_ids.device,
-        )
-        reference_attention = torch.zeros(
-            (batch_size, maximum_reference),
-            dtype=attention_mask.dtype,
-            device=attention_mask.device,
-        )
-        for index, row in enumerate(reference_rows):
-            reference_ids[index, -len(row) :] = torch.as_tensor(
-                row, dtype=input_ids.dtype, device=input_ids.device
-            )
-            reference_attention[index, -len(row) :] = 1
-
-        repeated_last = reference_ids[:, -1:].clone()
-        masks = torch.full(
-            (batch_size, self.n_future_tokens - 1),
-            self.mask_id,
-            dtype=input_ids.dtype,
-            device=input_ids.device,
-        )
-        geometry_ids = torch.cat((reference_ids, repeated_last, masks), dim=1)
-        geometry_attention = torch.cat(
-            (
-                reference_attention,
-                torch.ones(
-                    (batch_size, self.n_future_tokens),
-                    dtype=attention_mask.dtype,
-                    device=attention_mask.device,
-                ),
-            ),
-            dim=1,
+            prompt_last_ids=input_ids[:, -1],
         )
         full_attention = torch.cat((attention_mask, geometry_attention), dim=1)
         full_position_ids = full_attention.long().cumsum(-1) - 1
@@ -660,7 +679,7 @@ class PixelPIVRWaveDecoder:
                 if self.prefix_cache_mode == "shared":
                     cached_global, projected_locals = (
                         self._project_shared_prefix_and_locals(
-                            inputs, lengths, cached_global
+                            inputs, lengths, cached_global, chunk
                         )
                     )
                     candidate_prefix, suffix_rows = self._split_shared_prefix_rows(
@@ -685,7 +704,7 @@ class PixelPIVRWaveDecoder:
                     )
                 else:
                     cached_global, projected = self._project_cached_global_and_locals(
-                        inputs, lengths, cached_global
+                        inputs, lengths, cached_global, chunk
                     )
                     decoded = self._decode_atomic_blocks(
                         inputs, projected, chunk, allow_none=allow_none
@@ -748,8 +767,11 @@ class PixelPIVRWaveDecoder:
                 else 2 * len(effective_sizes)
             ),
             "global_moonvit_encodes": 1,
-            "local_moonvit_encodes": len(effective_sizes),
+            "local_moonvit_encodes": (
+                len(effective_sizes) if branches[0].crop is not None else 0
+            ),
             "native_geometry_block_tokens": 6,
             "geometry_decoding": "point_addressed_constrained_pbd6",
+            "geometry_prefix_mode": self.geometry_prefix_mode,
             "allow_none_for_predicted_points": bool(allow_none),
         }

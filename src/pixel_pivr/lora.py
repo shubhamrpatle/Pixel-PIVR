@@ -59,10 +59,22 @@ def trainable_state(model: nn.Module) -> dict[str, Any]:
     }
     if not lora:
         raise RuntimeError("Refusing to save an empty LoRA state")
-    return {"lora": lora, "controller": None}
+    controller_module = getattr(model, "pixel_pivr_controller", None)
+    controller = None
+    if controller_module is not None:
+        controller = {
+            name: tensor.detach().cpu().clone()
+            for name, tensor in controller_module.state_dict().items()
+        }
+    return {"lora": lora, "controller": controller}
 
 
-def restore_trainable_state(model: nn.Module, payload: Mapping[str, Any]) -> None:
+def restore_trainable_state(
+    model: nn.Module,
+    payload: Mapping[str, Any],
+    *,
+    require_controller: bool = False,
+) -> None:
     live = dict(model.named_parameters())
     saved = payload.get("lora")
     if not isinstance(saved, Mapping) or not saved:
@@ -88,6 +100,19 @@ def restore_trainable_state(model: nn.Module, payload: Mapping[str, Any]) -> Non
                     f"{tuple(parameter.shape)} != {tuple(tensor.shape)}"
                 )
             parameter.copy_(tensor.to(parameter.device, parameter.dtype))
+    saved_controller = payload.get("controller")
+    live_controller = getattr(model, "pixel_pivr_controller", None)
+    if saved_controller is None:
+        if require_controller:
+            raise RuntimeError("Checkpoint has no adaptive multi-scale controller")
+        return
+    if not isinstance(saved_controller, Mapping) or not saved_controller:
+        raise RuntimeError("Checkpoint controller state is malformed")
+    if live_controller is None:
+        if require_controller:
+            raise RuntimeError("Live model has no adaptive multi-scale controller")
+        return
+    live_controller.load_state_dict(saved_controller, strict=True)
 
 
 def load_adapter_checkpoint(
@@ -95,13 +120,21 @@ def load_adapter_checkpoint(
     checkpoint_path: str | Path,
     *,
     configure: bool = True,
+    allow_unsynchronized_distributed: bool = False,
 ) -> dict[str, Any]:
     checkpoint = torch.load(
         Path(checkpoint_path), map_location="cpu", weights_only=False
     )
     config = checkpoint.get("config") or {}
+    world_size = int(config.get("world_size", 1))
+    synchronized = config.get("synchronized_trainable_initialization") is True
+    if world_size > 1 and not synchronized and not allow_unsynchronized_distributed:
+        raise RuntimeError(
+            "Refusing a distributed Pixel-PIVR adapter whose trainable replicas "
+            "were not synchronized at initialization. Use only for diagnostics "
+            "with allow_unsynchronized_distributed=True."
+        )
     if configure:
         configure_lora_only(model, int(config["lora_rank"]))
     restore_trainable_state(model, checkpoint["trainable_state"])
     return checkpoint
-

@@ -19,7 +19,17 @@ import torch.distributed as dist
 from torch import nn
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
-from .data import make_dataset, make_loader
+from .attention import (
+    locateanything_attention_dispatch,
+    verify_locateanything_attention,
+)
+from .data import (
+    LossBalancedDataset,
+    make_dataset,
+    make_loader,
+    task_loss_balance_contract,
+    verify_packaged_data_signatures,
+)
 from .io import (
     append_jsonl,
     atomic_json,
@@ -38,9 +48,52 @@ from .magnified_modeling import (
     MagnifiedPreProjectorTrainingModel,
     MagnifiedROIMetadataDataset,
 )
+from .adaptive_multiscale import AdaptiveMultiScaleTrainingModel
 
 
-METRIC_KEYS = ("loss", "native_loss")
+METRIC_KEYS = (
+    "loss",
+    "native_loss",
+    "loss_weight",
+    "scale_active",
+    "scale_weight_0",
+    "scale_weight_1",
+    "scale_weight_2",
+)
+
+
+ADAPTIVE_CONTEXT = "adaptive_multiscale_preprojector_roi"
+PARAMETER_SYNC_POLICY = "rank0_broadcast_after_trainable_construction_v1"
+
+
+def seed_everything(seed: int) -> None:
+    """Seed model initialization or one rank's stochastic training stream."""
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(int(seed))
+    np.random.seed(int(seed))
+    random.seed(int(seed))
+
+
+def parse_int_csv(value: str) -> tuple[int, ...]:
+    try:
+        parsed = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Expected comma-separated integers") from exc
+    if len(parsed) < 2 or any(item <= 0 for item in parsed) or len(set(parsed)) != len(parsed):
+        raise argparse.ArgumentTypeError("Expected at least two unique positive scales")
+    return parsed
+
+
+def adaptive_config(args: argparse.Namespace) -> dict[str, Any]:
+    if args.visual_context != ADAPTIVE_CONTEXT:
+        return {}
+    return {
+        "multiscale_roi_pixels": list(args.multiscale_roi_pixels),
+        "multiscale_target_patches": int(args.multiscale_target_patches),
+        "multiscale_fusion_hidden": int(args.multiscale_fusion_hidden),
+        "multiscale_preferred_scale": int(args.multiscale_preferred_scale),
+    }
 
 
 def stratified_file_indices(
@@ -172,6 +225,44 @@ def synchronize_gradients(
             gradient.copy_(value)
 
 
+def synchronize_trainable_parameters(
+    module: nn.Module, world_size: int
+) -> dict[str, Any]:
+    """Make custom data-parallel replicas identical before gradient averaging.
+
+    This trainer does not wrap the model in DistributedDataParallel. Averaging
+    gradients is therefore correct only when every rank begins with identical
+    trainable tensors. LoRA A matrices and optional Pixel-PIVR controllers are
+    randomly initialized, so they must be broadcast explicitly.
+    """
+    named = [
+        (name, parameter)
+        for name, parameter in module.named_parameters()
+        if parameter.requires_grad
+    ]
+    if not named:
+        raise RuntimeError("No trainable parameters are available to synchronize")
+    metadata = [
+        (name, tuple(parameter.shape), str(parameter.dtype))
+        for name, parameter in named
+    ]
+    if world_size > 1:
+        replicas: list[Any] = [None] * world_size
+        dist.all_gather_object(replicas, metadata)
+        if any(replica != metadata for replica in replicas):
+            raise RuntimeError("Trainable parameter metadata differs across ranks")
+        with torch.no_grad():
+            for _name, parameter in named:
+                dist.broadcast(parameter.data, src=0)
+    return {
+        "policy": PARAMETER_SYNC_POLICY,
+        "tensors": len(named),
+        "parameters": sum(parameter.numel() for _name, parameter in named),
+        "source_rank": 0,
+        "world_size": int(world_size),
+    }
+
+
 def gather_rng_states(
     rank: int, world_size: int
 ) -> list[dict[str, torch.Tensor]] | None:
@@ -262,6 +353,27 @@ def shared_data_signatures(
     return list(value["train"]), list(value["validation"])
 
 
+def truncate_curve(path: Path, step_key: str, maximum_step: int) -> int:
+    """Drop uncheckpointed rows before resuming from an older aligned state."""
+    if not path.is_file():
+        return 0
+    retained: list[str] = []
+    removed = 0
+    with path.open("r", encoding="utf-8") as handle:
+        for number, line in enumerate(handle, 1):
+            if not line.strip():
+                raise ValueError(f"Blank curve row at {path}:{number}")
+            value = json.loads(line)
+            if int(value[step_key]) <= int(maximum_step):
+                retained.append(json.dumps(value, sort_keys=True) + "\n")
+            else:
+                removed += 1
+    temporary = path.with_name(f".{path.name}.resume-{os.getpid()}")
+    temporary.write_text("".join(retained), encoding="utf-8")
+    os.replace(temporary, path)
+    return removed
+
+
 def checkpoint_payload(
     *,
     args: argparse.Namespace,
@@ -277,10 +389,13 @@ def checkpoint_payload(
     train_signature: list[dict[str, Any]],
     validation_signature: list[dict[str, Any]],
     init_adapter_signature: dict[str, Any] | None,
+    parameter_sync: Mapping[str, Any],
+    loss_balancing: Mapping[str, Any],
     rng_states: list[dict[str, torch.Tensor]] | None,
+    vision_attention: str,
 ) -> dict[str, Any]:
     return {
-        "schema_version": "pixel-pivr-lora-checkpoint-v3",
+        "schema_version": "pixel-pivr-lora-checkpoint-v5",
         "config": {
             "experiment": str(args.visual_context),
             "base_model": str(args.model.resolve()),
@@ -294,14 +409,31 @@ def checkpoint_payload(
             "magnified_roi_pixels": int(args.magnified_roi_pixels),
             "magnified_roi_stride": int(args.magnified_roi_stride),
             "gradient_accumulation": int(args.gradient_accumulation),
+            "allowed_padding_records": int(args.allowed_padding_records),
+            "keep_recent_checkpoints": int(args.keep_recent_checkpoints),
+            "checkpoint_steps": int(args.checkpoint_steps),
+            "eval_steps": int(args.eval_steps),
+            "log_steps": int(args.log_steps),
             "max_steps": int(max_steps),
             "world_size": int(world_size),
             "seed": int(args.seed),
+            "learning_rate": float(args.learning_rate),
+            "weight_decay": float(args.weight_decay),
+            "max_grad_norm": float(args.max_grad_norm),
+            "warmup_steps": int(args.warmup_steps),
+            "workers": int(args.workers),
+            "vision_attention": str(vision_attention),
             "validation_sampling": str(args.validation_sampling),
             "validation_records": int(args.validation_records),
             "init_adapter": init_adapter_signature,
             "sample_order": str(args.sample_order),
+            "synchronized_trainable_initialization": True,
+            "distributed_parameter_sync": str(parameter_sync["policy"]),
+            "trainable_parameter_tensors": int(parameter_sync["tensors"]),
+            "trainable_parameter_count": int(parameter_sync["parameters"]),
             "lora_audit": dict(lora_audit),
+            "loss_balancing": dict(loss_balancing),
+            **adaptive_config(args),
         },
         "step": int(step),
         "exposure": int(exposure),
@@ -324,6 +456,8 @@ def verify_resume_contract(
     train_signature: list[dict[str, Any]],
     validation_signature: list[dict[str, Any]],
     init_adapter_signature: dict[str, Any] | None,
+    loss_balancing: Mapping[str, Any],
+    vision_attention: str,
 ) -> None:
     config = payload.get("config") or {}
     expected = {
@@ -338,13 +472,28 @@ def verify_resume_contract(
         "magnified_roi_pixels": int(args.magnified_roi_pixels),
         "magnified_roi_stride": int(args.magnified_roi_stride),
         "gradient_accumulation": int(args.gradient_accumulation),
+        "allowed_padding_records": int(args.allowed_padding_records),
+        "keep_recent_checkpoints": int(args.keep_recent_checkpoints),
+        "checkpoint_steps": int(args.checkpoint_steps),
+        "eval_steps": int(args.eval_steps),
+        "log_steps": int(args.log_steps),
         "max_steps": int(max_steps),
         "world_size": int(world_size),
         "seed": int(args.seed),
+        "learning_rate": float(args.learning_rate),
+        "weight_decay": float(args.weight_decay),
+        "max_grad_norm": float(args.max_grad_norm),
+        "warmup_steps": int(args.warmup_steps),
+        "workers": int(args.workers),
+        "vision_attention": str(vision_attention),
         "validation_sampling": str(args.validation_sampling),
         "validation_records": int(args.validation_records),
         "init_adapter": init_adapter_signature,
         "sample_order": str(args.sample_order),
+        "synchronized_trainable_initialization": True,
+        "distributed_parameter_sync": PARAMETER_SYNC_POLICY,
+        "loss_balancing": dict(loss_balancing),
+        **adaptive_config(args),
     }
     mismatches = {
         key: {"saved": config.get(key), "requested": value}
@@ -357,6 +506,62 @@ def verify_resume_contract(
         )
 
 
+def prune_checkpoints(output: Path, keep_recent: int) -> list[str]:
+    """Retain the best target plus the newest aligned checkpoints."""
+    checkpoints = sorted(output.glob("checkpoint-step*.pt"))
+    protected = set(checkpoints[-int(keep_recent) :])
+    for link_name in ("best.pt", "last.pt"):
+        link = output / link_name
+        if link.exists() or link.is_symlink():
+            protected.add(link.resolve())
+    removed = []
+    for path in checkpoints:
+        if path.resolve() not in protected:
+            path.unlink()
+            removed.append(path.name)
+    return removed
+
+
+def completion_payload(
+    *,
+    output: Path,
+    step: int,
+    exposure: int,
+    required_exposures: int,
+    train_records: int,
+    world_size: int,
+    gradient_accumulation: int,
+    global_records_per_step: int,
+    parameter_sync: Mapping[str, Any],
+    loss_balancing: Mapping[str, Any],
+) -> dict[str, Any]:
+    if step <= 0 or exposure != required_exposures or exposure < train_records:
+        raise RuntimeError(
+            "Cannot certify completion: "
+            f"step={step}, exposure={exposure}, required={required_exposures}, "
+            f"records={train_records}"
+        )
+    best, last = output / "best.pt", output / "last.pt"
+    if not (best.is_file() and last.is_file()):
+        raise RuntimeError("Cannot certify completion without both best.pt and last.pt")
+    return {
+        "schema_version": "pixel-pivr-done-v3",
+        "steps": int(step),
+        "record_exposures": int(exposure),
+        "unique_training_records": int(train_records),
+        "padding_record_exposures": int(exposure - train_records),
+        "loss_balancing": dict(loss_balancing),
+        "world_size": int(world_size),
+        "gradient_accumulation": int(gradient_accumulation),
+        "records_per_optimizer_step": int(global_records_per_step),
+        "complete_one_pass": True,
+        "synchronized_trainable_initialization": True,
+        "distributed_parameter_sync": str(parameter_sync["policy"]),
+        "best": str(best.resolve()),
+        "last": str(last.resolve()),
+    }
+
+
 def train(args: argparse.Namespace) -> None:
     from transformers import AutoConfig, AutoModel, AutoProcessor
 
@@ -364,11 +569,9 @@ def train(args: argparse.Namespace) -> None:
         raise RuntimeError("CUDA is required")
     rank, local_rank, world_size = distributed_context()
     device = torch.device(f"cuda:{local_rank}")
-    process_seed = int(args.seed) + rank
-    torch.manual_seed(process_seed)
-    torch.cuda.manual_seed(process_seed)
-    np.random.seed(process_seed)
-    random.seed(process_seed)
+    # Use one initialization stream on every rank. A rank-specific stream is set
+    # only after all trainable tensors have been synchronized below.
+    seed_everything(int(args.seed))
     torch.set_float32_matmul_precision("high")
 
     train_paths = [path.resolve() for path in args.train_data]
@@ -380,6 +583,9 @@ def train(args: argparse.Namespace) -> None:
         rank=rank,
         world_size=world_size,
     )
+    package_integrity = verify_packaged_data_signatures(
+        args.data_root, train_signature, validation_signature
+    )
     adapter_payload: list[Any] = [None]
     if rank == 0 and args.init_adapter is not None:
         adapter_payload[0] = data_signature([args.init_adapter.resolve()])[0]
@@ -388,6 +594,9 @@ def train(args: argparse.Namespace) -> None:
     init_adapter_signature = adapter_payload[0]
     train_records = sum(int(row["records"]) for row in train_signature)
     validation_records = sum(int(row["records"]) for row in validation_signature)
+    loss_balancing = task_loss_balance_contract(
+        train_signature, str(args.loss_balancing)
+    )
     if args.expected_train_records and train_records != args.expected_train_records:
         raise RuntimeError(
             f"Train count changed: {train_records} != {args.expected_train_records}"
@@ -446,16 +655,20 @@ def train(args: argparse.Namespace) -> None:
     config.text_config._attn_implementation_autoset = False
     config.vision_config._attn_implementation = vision_attention
     config.vision_config._attn_implementation_autoset = False
+    attention_dispatch = locateanything_attention_dispatch(vision_attention)
+
     def load_model() -> nn.Module:
-        return AutoModel.from_pretrained(
+        loaded = AutoModel.from_pretrained(
             args.model,
             config=config,
             trust_remote_code=True,
             local_files_only=not args.allow_download,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             low_cpu_mem_usage=True,
-            attn_implementation="sdpa",
+            attn_implementation=attention_dispatch,
         ).to(device)
+        verify_locateanything_attention(loaded, vision_attention)
+        return loaded
 
     if args.serial_model_load and world_size > 1:
         model = None
@@ -502,7 +715,7 @@ def train(args: argparse.Namespace) -> None:
         eagle_root=args.eagle_root,
         block_size=6,
     )
-    if args.visual_context == "preprojector_magnified_roi":
+    if args.visual_context in {"preprojector_magnified_roi", ADAPTIVE_CONTEXT}:
         train_dataset = MagnifiedROIMetadataDataset(train_dataset)
         validation_dataset = MagnifiedROIMetadataDataset(validation_dataset)
         image_start_id = processor.tokenizer.convert_tokens_to_ids(
@@ -511,21 +724,51 @@ def train(args: argparse.Namespace) -> None:
         image_end_id = processor.tokenizer.convert_tokens_to_ids(
             processor.image_end_token
         )
-        wrapper = MagnifiedPreProjectorTrainingModel(
-            model,
-            roi_pixels=args.magnified_roi_pixels,
-            roi_stride=args.magnified_roi_stride,
-            image_start_id=image_start_id,
-            image_end_id=image_end_id,
-            max_sequence=args.max_sequence,
-        ).to(device)
+        if args.visual_context == ADAPTIVE_CONTEXT:
+            wrapper = AdaptiveMultiScaleTrainingModel(
+                model,
+                roi_pixels=args.multiscale_roi_pixels,
+                target_patches=args.multiscale_target_patches,
+                roi_stride=args.magnified_roi_stride,
+                fusion_hidden=args.multiscale_fusion_hidden,
+                preferred_scale=args.multiscale_preferred_scale,
+                image_start_id=image_start_id,
+                image_end_id=image_end_id,
+                max_sequence=args.max_sequence,
+            ).to(device)
+            if args.init_adapter is not None:
+                restore_trainable_state(
+                    model,
+                    initial["trainable_state"],
+                    require_controller=True,
+                )
+        else:
+            wrapper = MagnifiedPreProjectorTrainingModel(
+                model,
+                roi_pixels=args.magnified_roi_pixels,
+                roi_stride=args.magnified_roi_stride,
+                image_start_id=image_start_id,
+                image_end_id=image_end_id,
+                max_sequence=args.max_sequence,
+            ).to(device)
     else:
         wrapper = PixelPIVRTrainingModel(model).to(device)
+    train_dataset = LossBalancedDataset(
+        train_dataset, train_signature, loss_balancing
+    )
+    parameter_sync = synchronize_trainable_parameters(wrapper, world_size)
+    process_seed = int(args.seed) + rank
+    seed_everything(process_seed)
+    rank_log(
+        rank,
+        "synchronized trainable initialization "
+        f"({parameter_sync['tensors']} tensors, {parameter_sync['parameters']} parameters)",
+    )
     if len(train_dataset) != train_records or len(validation_dataset) != validation_records:
         raise RuntimeError("Eagle loader counts disagree with signed JSONL counts")
     rank_log(rank, "dataset construction complete")
 
-    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    trainable = [parameter for parameter in wrapper.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(
         trainable,
         lr=args.learning_rate,
@@ -543,19 +786,29 @@ def train(args: argparse.Namespace) -> None:
         output.mkdir(parents=True, exist_ok=True)
         signature_path = output / "run_contract.json"
         contract = {
-            "schema_version": "pixel-pivr-run-contract-v2",
+            "schema_version": "pixel-pivr-run-contract-v5",
             "model": str(args.model.resolve()),
             "data_root": str(args.data_root.resolve()),
             "train_data": train_signature,
             "validation_data": validation_signature,
             "world_size": world_size,
             "gradient_accumulation": args.gradient_accumulation,
+            "allowed_padding_records": int(args.allowed_padding_records),
+            "keep_recent_checkpoints": int(args.keep_recent_checkpoints),
+            "checkpoint_steps": int(args.checkpoint_steps),
+            "eval_steps": int(args.eval_steps),
+            "log_steps": int(args.log_steps),
             "global_records_per_step": global_records_per_step,
             "max_steps": max_steps,
             "required_exposures": required_exposures,
-            "allowed_padding_records": args.allowed_padding_records,
+            "learning_rate": float(args.learning_rate),
+            "weight_decay": float(args.weight_decay),
+            "max_grad_norm": float(args.max_grad_norm),
+            "warmup_steps": int(args.warmup_steps),
+            "workers": int(args.workers),
             "lora": lora_audit,
             "vision_attention": vision_attention,
+            "attention_dispatch": attention_dispatch,
             "visual_context": str(args.visual_context),
             "magnified_roi_pixels": int(args.magnified_roi_pixels),
             "magnified_roi_stride": int(args.magnified_roi_stride),
@@ -563,6 +816,13 @@ def train(args: argparse.Namespace) -> None:
             "validation_sampling": str(args.validation_sampling),
             "validation_records": int(args.validation_records),
             "sample_order": str(args.sample_order),
+            "synchronized_trainable_initialization": True,
+            "distributed_parameter_sync": str(parameter_sync["policy"]),
+            "trainable_parameter_tensors": int(parameter_sync["tensors"]),
+            "trainable_parameter_count": int(parameter_sync["parameters"]),
+            "loss_balancing": loss_balancing,
+            "package_integrity": package_integrity,
+            **adaptive_config(args),
         }
         if signature_path.exists():
             saved = json.loads(signature_path.read_text(encoding="utf-8"))
@@ -590,8 +850,14 @@ def train(args: argparse.Namespace) -> None:
             train_signature=train_signature,
             validation_signature=validation_signature,
             init_adapter_signature=init_adapter_signature,
+            loss_balancing=loss_balancing,
+            vision_attention=vision_attention,
         )
-        restore_trainable_state(model, payload["trainable_state"])
+        restore_trainable_state(
+            model,
+            payload["trainable_state"],
+            require_controller=args.visual_context == ADAPTIVE_CONTEXT,
+        )
         optimizer.load_state_dict(payload["optimizer_state"])
         scheduler.load_state_dict(payload["scheduler_state"])
         start_step = int(payload["step"])
@@ -604,13 +870,78 @@ def train(args: argparse.Namespace) -> None:
         if best_path.exists() or best_path.is_symlink():
             best = torch.load(best_path, map_location="cpu", weights_only=False)
             best_validation = float(best["validation"]["native_loss"])
-    elif args.no_resume and output_had_contents:
-        raise RuntimeError(f"--no-resume requires an empty output directory: {output}")
+        if rank == 0:
+            removed_train = truncate_curve(
+                output / "training_curve.jsonl", "step", start_step
+            )
+            removed_validation = truncate_curve(
+                output / "validation_curve.jsonl", "validation_step", start_step
+            )
+            if removed_train or removed_validation:
+                rank_log(
+                    rank,
+                    "removed uncheckpointed curve rows before resume: "
+                    f"train={removed_train}, validation={removed_validation}",
+                )
+    elif output_had_contents:
+        if args.no_resume:
+            raise RuntimeError(
+                f"--no-resume requires an empty output directory: {output}"
+            )
+        orphaned = sorted(output.glob("checkpoint-step*.pt"))
+        state_markers = [
+            path for path in (output / "status.json", output / "done.json")
+            if path.exists()
+        ]
+        if orphaned or state_markers:
+            raise RuntimeError(
+                "Output contains checkpoint state but no aligned last.pt; refusing "
+                "automatic recovery. Inspect: "
+                + ", ".join(str(path) for path in [*orphaned, *state_markers])
+            )
+        if rank == 0:
+            removed_train = truncate_curve(
+                output / "training_curve.jsonl", "step", 0
+            )
+            removed_validation = truncate_curve(
+                output / "validation_curve.jsonl", "validation_step", 0
+            )
+            if removed_train or removed_validation:
+                rank_log(
+                    rank,
+                    "no aligned checkpoint existed; restarting from step zero and "
+                    f"discarding train={removed_train}, validation={removed_validation} rows",
+                )
+        if world_size > 1:
+            dist.barrier(device_ids=[local_rank])
 
     if start_step >= max_steps:
+        if start_step != max_steps or start_exposure != required_exposures:
+            raise RuntimeError(
+                "Completed checkpoint counters are inconsistent: "
+                f"step={start_step}/{max_steps}, "
+                f"exposure={start_exposure}/{required_exposures}"
+            )
         if rank == 0:
+            atomic_json(
+                output / "done.json",
+                completion_payload(
+                    output=output,
+                    step=start_step,
+                    exposure=start_exposure,
+                    required_exposures=required_exposures,
+                    train_records=train_records,
+                    world_size=world_size,
+                    gradient_accumulation=int(args.gradient_accumulation),
+                    global_records_per_step=global_records_per_step,
+                    parameter_sync=parameter_sync,
+                    loss_balancing=loss_balancing,
+                ),
+            )
+            (output / "interrupted.json").unlink(missing_ok=True)
             print(f"Pixel-PIVR training already complete at step {start_step}")
         if world_size > 1:
+            dist.barrier(device_ids=[local_rank])
             dist.destroy_process_group()
         return
     if start_exposure % world_size:
@@ -714,13 +1045,19 @@ def train(args: argparse.Namespace) -> None:
                 train_signature=train_signature,
                 validation_signature=validation_signature,
                 init_adapter_signature=init_adapter_signature,
+                parameter_sync=parameter_sync,
+                loss_balancing=loss_balancing,
                 rng_states=rng_states,
+                vision_attention=vision_attention,
             )
             atomic_torch_save(checkpoint, payload)
             update_symlink(output / "last.pt", checkpoint)
             if validation is not None and validation["native_loss"] < best_validation:
                 best_validation = validation["native_loss"]
                 update_symlink(output / "best.pt", checkpoint)
+            removed_checkpoints = prune_checkpoints(
+                output, int(args.keep_recent_checkpoints)
+            )
             atomic_json(
                 output / "status.json",
                 {
@@ -732,7 +1069,10 @@ def train(args: argparse.Namespace) -> None:
                     "validation": validation,
                     "best_validation_native_loss": best_validation,
                     "reason": reason,
+                    "removed_checkpoints": removed_checkpoints,
                     "complete_one_pass": exposure >= train_records,
+                    "synchronized_trainable_initialization": True,
+                    "distributed_parameter_sync": str(parameter_sync["policy"]),
                 },
             )
         if world_size > 1:
@@ -771,9 +1111,10 @@ def train(args: argparse.Namespace) -> None:
                 **averaged,
             }
             append_jsonl(output / "training_curve.jsonl", record)
-            if wandb_run is not None:
+            report_step = step == 1 or step % args.log_steps == 0 or step == max_steps
+            if wandb_run is not None and report_step:
                 wandb_run.log({f"train/{key}": value for key, value in record.items()}, step=step)
-            if step == 1 or step % args.log_steps == 0:
+            if report_step:
                 print(json.dumps(record, sort_keys=True), flush=True)
 
         stop_flag = torch.tensor(
@@ -832,19 +1173,18 @@ def train(args: argparse.Namespace) -> None:
     if rank == 0:
         atomic_json(
             output / "done.json",
-            {
-                "schema_version": "pixel-pivr-done-v2",
-                "steps": step,
-                "record_exposures": exposure,
-                "unique_training_records": train_records,
-                "padding_record_exposures": max(0, exposure - train_records),
-                "world_size": world_size,
-                "gradient_accumulation": int(args.gradient_accumulation),
-                "records_per_optimizer_step": global_records_per_step,
-                "complete_one_pass": exposure >= train_records,
-                "best": str((output / "best.pt").resolve()),
-                "last": str((output / "last.pt").resolve()),
-            },
+            completion_payload(
+                output=output,
+                step=step,
+                exposure=exposure,
+                required_exposures=required_exposures,
+                train_records=train_records,
+                world_size=world_size,
+                gradient_accumulation=int(args.gradient_accumulation),
+                global_records_per_step=global_records_per_step,
+                parameter_sync=parameter_sync,
+                loss_balancing=loss_balancing,
+            ),
         )
         (output / "interrupted.json").unlink(missing_ok=True)
         if wandb_run is not None:
@@ -873,11 +1213,24 @@ def parse_args() -> argparse.Namespace:
         help="Select validation rows evenly across files or from the concatenated prefix",
     )
     parser.add_argument("--lora-rank", type=int, default=16)
+    parser.add_argument(
+        "--loss-balancing",
+        choices=("none", "source_query_task"),
+        default="none",
+        help=(
+            "Preserve the Round-1 source-query task mixture after one-address-per-row "
+            "expansion, or optimize an unweighted flat-record mean"
+        ),
+    )
     parser.add_argument("--image-token-limit", type=int, default=1024)
     parser.add_argument("--max-sequence", type=int, default=8192)
     parser.add_argument(
         "--visual-context",
-        choices=("pixel_reencoded", "preprojector_magnified_roi"),
+        choices=(
+            "pixel_reencoded",
+            "preprojector_magnified_roi",
+            ADAPTIVE_CONTEXT,
+        ),
         default="pixel_reencoded",
     )
     parser.add_argument(
@@ -893,6 +1246,15 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Stride 1 is the magnified path; stride 2 is its native-density control",
     )
+    parser.add_argument(
+        "--multiscale-roi-pixels",
+        type=parse_int_csv,
+        default=(196, 378, 756),
+        help="Comma-separated cached-feature fields for adaptive local re-entry",
+    )
+    parser.add_argument("--multiscale-target-patches", type=int, default=27)
+    parser.add_argument("--multiscale-fusion-hidden", type=int, default=128)
+    parser.add_argument("--multiscale-preferred-scale", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=0)
     parser.add_argument("--gradient-accumulation", type=int, default=1)
     parser.add_argument("--allowed-padding-records", type=int, default=0)
@@ -907,6 +1269,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--checkpoint-steps", type=int, default=500)
+    parser.add_argument(
+        "--keep-recent-checkpoints",
+        type=int,
+        default=1,
+        help="Keep this many newest checkpoint files in addition to best.pt",
+    )
     parser.add_argument("--eval-steps", type=int, default=500)
     parser.add_argument("--log-steps", type=int, default=10)
     parser.add_argument("--workers", type=int, default=2)
@@ -950,8 +1318,11 @@ def parse_args() -> argparse.Namespace:
         "max_sequence",
         "magnified_roi_pixels",
         "magnified_roi_stride",
+        "multiscale_target_patches",
+        "multiscale_fusion_hidden",
         "gradient_accumulation",
         "checkpoint_steps",
+        "keep_recent_checkpoints",
         "eval_steps",
         "log_steps",
     ):
@@ -959,6 +1330,8 @@ def parse_args() -> argparse.Namespace:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.max_steps < 0 or args.allowed_padding_records < 0:
         parser.error("Step and padding counts cannot be negative")
+    if not 0 <= args.multiscale_preferred_scale < len(args.multiscale_roi_pixels):
+        parser.error("--multiscale-preferred-scale is outside --multiscale-roi-pixels")
     return args
 
 

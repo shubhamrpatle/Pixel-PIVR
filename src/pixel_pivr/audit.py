@@ -8,7 +8,7 @@ import os
 import re
 from collections import Counter
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from PIL import Image
 import torch
@@ -24,6 +24,10 @@ HBB_RE = re.compile(
     re.IGNORECASE,
 )
 NONE_RE = re.compile(r"<box>\s*None\s*</box>", re.IGNORECASE)
+FEATURE_REENTRY_CONTEXTS = {
+    "preprojector_magnified_roi",
+    "adaptive_multiscale_preprojector_roi",
+}
 
 
 def assistant_text(row: Mapping[str, Any]) -> str:
@@ -32,6 +36,71 @@ def assistant_text(row: Mapping[str, Any]) -> str:
         for turn in row.get("conversations") or []
         if str(turn.get("from") or "").lower() in {"gpt", "assistant"}
     )
+
+
+def loader_stress_rows(
+    paths: Sequence[Path],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Select deterministic hard rows from every annotation shard.
+
+    Full package verification already parses every record. This smaller set is for
+    exercising the real LocateAnything processor and patched Eagle loader during
+    destination preflight. It covers the longest conversation, largest source
+    image, largest target set, and an explicit-None row (when present) in every
+    shard.
+    """
+    selected_rows: list[dict[str, Any]] = []
+    evidence: list[dict[str, Any]] = []
+    for path in paths:
+        best: dict[str, tuple[int, int, dict[str, Any]]] = {}
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, 1):
+                if not line.strip():
+                    raise ValueError(f"Blank JSONL line at {path}:{line_number}")
+                row = json.loads(line)
+                meta = row.get("meta") or {}
+                source_size = meta.get("pivr_source_image_size") or [0, 0]
+                if not isinstance(source_size, (list, tuple)) or len(source_size) != 2:
+                    source_size = [0, 0]
+                scores = {
+                    "longest_conversation": sum(
+                        len(str(turn.get("value") or ""))
+                        for turn in row.get("conversations") or []
+                    ),
+                    "largest_source_image": int(source_size[0]) * int(source_size[1]),
+                    "highest_target_count": int(meta.get("target_count") or 0),
+                }
+                if int(meta.get("target_count") or 0) == 0:
+                    scores["explicit_none"] = 1
+                for reason, score in scores.items():
+                    current = best.get(reason)
+                    # Retain the earliest row when scores tie.
+                    candidate = (int(score), -line_number, row)
+                    if current is None or candidate[:2] > current[:2]:
+                        best[reason] = candidate
+
+        by_line: dict[int, dict[str, Any]] = {}
+        reasons_by_line: dict[int, list[str]] = {}
+        for reason, candidate in best.items():
+            line_number = -int(candidate[1])
+            row = candidate[2]
+            record_id = str((row.get("meta") or {}).get("record_id") or "")
+            if not record_id:
+                raise ValueError(f"Stress candidate has no record_id in {path}")
+            by_line[line_number] = row
+            reasons_by_line.setdefault(line_number, []).append(reason)
+        for line_number in sorted(by_line):
+            row = by_line[line_number]
+            selected_rows.append(row)
+            evidence.append(
+                {
+                    "source": str(path.resolve()),
+                    "line": line_number,
+                    "record_id": str((row.get("meta") or {}).get("record_id")),
+                    "reasons": sorted(set(reasons_by_line[line_number])),
+                }
+            )
+    return selected_rows, evidence
 
 
 def resolve_path(raw: str, data_root: Path) -> Path:
@@ -101,18 +170,43 @@ def validate_row(
             if any(not 0 <= int(value) <= 1000 for value in point):
                 raise ValueError(f"Point coordinate outside [0,1000]: {point}")
     else:
-        magnified = visual_context == "preprojector_magnified_roi"
+        magnified = visual_context in FEATURE_REENTRY_CONTEXTS
+        pixel_reencoded = visual_context == "pixel_reencoded"
+        round2_route = str(meta.get("pivr_round2_route") or "")
         if magnified:
             if isinstance(images, list) or not isinstance(images, str):
                 raise ValueError("Magnified re-entry requires one global image")
             validate_image_item(images, data_root)
+        elif pixel_reencoded:
+            if round2_route == "local_first":
+                if not isinstance(images, list) or len(images) != 2:
+                    raise ValueError(
+                        "Local pixel re-entry must contain [global image, virtual crop]"
+                    )
+                if not isinstance(images[0], str):
+                    raise ValueError("The first local re-entry image must be the global scene")
+                if not isinstance(images[1], Mapping) or not images[1].get(
+                    "virtual_crop"
+                ):
+                    raise ValueError("The second local re-entry image must be a virtual crop")
+                for item in images:
+                    validate_image_item(item, data_root)
+            elif round2_route == "global_fallback":
+                if isinstance(images, list) or not isinstance(images, str):
+                    raise ValueError("Global fallback must contain exactly one global image")
+                validate_image_item(images, data_root)
+            else:
+                raise ValueError(
+                    f"Pixel re-entry has unknown pivr_round2_route: {round2_route!r}"
+                )
+            if refs:
+                raise ValueError(
+                    "Magnified-v2 Round-2 supervision is box-only and must not emit <ref>"
+                )
         else:
-            if not isinstance(images, list) or len(images) != 2:
-                raise ValueError("Re-entry must contain [global image, local image]")
-            for item in images:
-                validate_image_item(item, data_root)
-        if len(refs) != 1:
-            raise ValueError(f"Re-entry requires one <ref>, found {len(refs)}")
+            raise ValueError(f"Unsupported visual context: {visual_context!r}")
+        if magnified and len(refs) != 1:
+            raise ValueError(f"Cached re-entry requires one <ref>, found {len(refs)}")
         if len(boxes) + none_count != 1:
             raise ValueError("Re-entry requires exactly one HBB or explicit None")
         if boxes:
@@ -122,11 +216,9 @@ def validate_row(
             x1, y1, x2, y2 = values
             if x2 <= x1 or y2 <= y1:
                 raise ValueError(f"Degenerate HBB: {values}")
-            address_point = (
-                meta.get("pivr_global_point")
-                if magnified
-                else meta.get("pivr_local_point")
-            )
+            address_point = meta.get("pivr_global_point")
+            if pixel_reencoded and round2_route == "local_first":
+                address_point = meta.get("pivr_local_point")
             if address_point is None and magnified:
                 address_point = meta.get("pivr_branch_point")
             if address_point is not None:
@@ -135,8 +227,11 @@ def validate_row(
                     raise ValueError(
                         f"Address {address_point} is outside target {values}"
                     )
-        if meta.get("pivr_target_fully_contained") is not True:
-            raise ValueError("Re-entry target containment is not explicitly true")
+        if magnified and meta.get("pivr_target_fully_contained") is not True:
+            raise ValueError("Cached re-entry target containment is not explicitly true")
+        if pixel_reencoded and round2_route == "local_first" and boxes:
+            if meta.get("pivr_target_fully_contained") is not True:
+                raise ValueError("A positive local box must be fully contained")
 
     expected = int(meta.get("target_count") or 0)
     observed = len(points) if route == "global_point_discovery" else len(boxes)
@@ -226,31 +321,39 @@ def exact_loader_audit(args: argparse.Namespace) -> dict[str, Any]:
         eagle_root=args.eagle_root,
         block_size=6,
     )
-    if args.visual_context == "preprojector_magnified_roi":
+    if args.visual_context in FEATURE_REENTRY_CONTEXTS:
         from .magnified_modeling import MagnifiedROIMetadataDataset
 
         dataset = MagnifiedROIMetadataDataset(dataset)
     maximum = 0
+    maximum_index = None
     supervised = 0
     limit = len(dataset) if args.limit is None else min(args.limit, len(dataset))
     for index in range(limit):
         sample = dataset[index]
         length = int(sample["input_ids"].numel())
         local_tokens = 0
-        if args.visual_context == "preprojector_magnified_roi" and bool(
+        if args.visual_context in FEATURE_REENTRY_CONTEXTS and bool(
             torch.as_tensor(sample["magnified_roi_enabled"]).item()
         ):
             grid_h, grid_w = (
                 int(value) for value in torch.as_tensor(sample["image_grid_hws"])[0]
             )
             patch_size = int(processor.image_processor.patch_size)
-            side = max(2, int(round(args.magnified_roi_pixels / patch_size)))
-            window_h, window_w = min(side, grid_h), min(side, grid_w)
-            local_h = (window_h - 2) // args.magnified_roi_stride + 1
-            local_w = (window_w - 2) // args.magnified_roi_stride + 1
+            if args.visual_context == "adaptive_multiscale_preprojector_roi":
+                target = int(args.multiscale_target_patches)
+                local_h = (target - 2) // args.magnified_roi_stride + 1
+                local_w = (target - 2) // args.magnified_roi_stride + 1
+            else:
+                side = max(2, int(round(args.magnified_roi_pixels / patch_size)))
+                window_h, window_w = min(side, grid_h), min(side, grid_w)
+                local_h = (window_h - 2) // args.magnified_roi_stride + 1
+                local_w = (window_w - 2) // args.magnified_roi_stride + 1
             local_tokens = local_h * local_w
             length += local_tokens + 2
-        maximum = max(maximum, length)
+        if length > maximum:
+            maximum = length
+            maximum_index = index
         supervised += int(sample["labels"].ne(-100).sum().item())
         if length > args.max_sequence:
             raise RuntimeError(
@@ -262,11 +365,13 @@ def exact_loader_audit(args: argparse.Namespace) -> dict[str, Any]:
         "records_checked": limit,
         "dataset_records": len(dataset),
         "max_post_mtp_tokens": maximum,
+        "max_post_mtp_index": maximum_index,
         "supervised_tokens": supervised,
         "max_sequence": args.max_sequence,
         "visual_context": args.visual_context,
         "magnified_roi_pixels": args.magnified_roi_pixels,
         "magnified_roi_stride": args.magnified_roi_stride,
+        "multiscale_target_patches": args.multiscale_target_patches,
     }
 
 
@@ -283,13 +388,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-sequence", type=int, default=8192)
     parser.add_argument(
         "--visual-context",
-        choices=("pixel_reencoded", "preprojector_magnified_roi"),
+        choices=(
+            "pixel_reencoded",
+            "preprojector_magnified_roi",
+            "adaptive_multiscale_preprojector_roi",
+        ),
         default="pixel_reencoded",
     )
     parser.add_argument("--magnified-roi-pixels", type=int, default=380)
     parser.add_argument(
         "--magnified-roi-stride", type=int, choices=(1, 2), default=1
     )
+    parser.add_argument("--multiscale-target-patches", type=int, default=27)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--allow-download", action="store_true")
     args = parser.parse_args()

@@ -1,85 +1,59 @@
-# Transfer And GitHub Release
+# Code and Data Transfer
 
-The repository intentionally excludes model weights, images, JSONL datasets,
-checkpoints, caches, and experiment outputs. Transfer those separately and keep
-their paths in a machine-local `configs/large_scale.env`, which is ignored by
-Git.
+GitHub carries code only. Hugging Face carries the versioned dataset bundle.
+Model weights, materialized images, checkpoints, caches, W&B files, and run
+outputs are excluded by `.gitignore`.
 
-## Create A Verified Source Archive
+## GitHub release
 
-From the directory containing `Pixel-PIVR`:
-
-```bash
-cd /path/to/Pixel-PIVR
-python tools/verify_release.py
-PYTHONPATH=src python -m unittest discover -s tests -v
-cd ..
-tar --exclude='Pixel-PIVR/.git' \
-    --exclude='*/__pycache__' \
-    --exclude='*.pyc' \
-    --exclude='Pixel-PIVR/.cache' \
-    --exclude='Pixel-PIVR/runs' \
-    --exclude='Pixel-PIVR/configs/*.env' \
-    -czf Pixel-PIVR-source.tar.gz Pixel-PIVR
-sha256sum Pixel-PIVR-source.tar.gz > Pixel-PIVR-source.tar.gz.sha256
-```
-
-On the destination machine:
-
-```bash
-sha256sum -c Pixel-PIVR-source.tar.gz.sha256
-tar -xzf Pixel-PIVR-source.tar.gz
-cd Pixel-PIVR
-python tools/verify_release.py
-PYTHONPATH=src python -m unittest discover -s tests -v
-```
-
-## Upload To GitHub
-
-Create an empty repository on GitHub, then run locally:
+Before committing:
 
 ```bash
 cd /path/to/Pixel-PIVR
-git init
+source .venv/bin/activate
+python tools/verify_release.py
+PYTHONPATH=src pytest -q
+bash -n scripts/*.sh
+python tools/source_manifest.py check
+git diff --check
+git status --short
+```
+
+Commit and push only after every command passes:
+
+```bash
 git add .
-git commit -m "Release standalone Pixel-PIVR implementation"
-git branch -M main
-git remote add origin git@github.com:YOUR_ACCOUNT/Pixel-PIVR.git
-git push -u origin main
+git commit -m "Release magnified-v2 full-scale pipeline"
+git push origin main
+git rev-parse HEAD
+git ls-remote origin refs/heads/main
 ```
 
-Choose and add a license before making the repository public. This package does
-not redistribute LocateAnything, Eagle, or model weights; review their licenses
-and cite them separately.
+The two revisions must match. Supply that 40-character commit to the A100
+operator; the remote preflight rejects any other checkout or modified tracked
+file.
 
-## Data And Checkpoints
+## Dataset release
 
-The 16K magnified experiment needs the JSONL records, every referenced image,
-LocateAnything checkpoint, Eagle loader, and benchmark holdout hash list. Build a
-minimal file list from the source workspace:
+Follow `docs/HUGGINGFACE_DATASET.md`. The final flow is:
 
-```bash
-python tools/build_asset_manifest.py \
-  --data-root /source/workspace \
-  --dataset-dir /source/workspace/path/to/pivr_cached_projected_roi_4k_v1 \
-  --model /source/workspace/path/to/LocateAnything-3B \
-  --eagle-root /source/workspace/path/to/Eagle/Embodied \
-  --holdout-hashes /source/workspace/path/to/all_benchmark_eval_image_sha256.txt \
-  --output-list /tmp/pixel_pivr_assets.txt \
-  --report /tmp/pixel_pivr_assets.json
-```
+1. Build and fully verify a materialized magnified-v2 package.
+2. Build deterministic image tar shards and verify every archive member.
+3. Upload to `shubhampatle/Pixel-PIVR-Magnified-v2` with
+   `hf upload-large-folder`.
+4. Resolve the immutable Hub commit.
+5. Run `tools/verify_hf_snapshot.py` against that exact remote commit.
+6. Give the passed `DATA_REVISION` to the A100 operator.
 
-Transfer exactly those files while preserving their paths relative to
-`--data-root`:
+Do not use the older `shubhampatle/Pixel-PIVR` snapshot for magnified-v2.
 
-```bash
-rsync -ahP -s --partial --append-verify \
-  --files-from=/tmp/pixel_pivr_assets.txt \
-  /source/workspace/ user@host:/destination/workspace/
-```
+## Destination machine
 
-After transfer, run `pixel-pivr-audit` on the destination and compare the JSONL
-SHA256 values in its report with the source report. Then populate
-`configs/large_scale.env` and run `check`, `smoke`, and finally `train` in that
-order. Do not publish these assets until the licenses and redistribution terms of
-each source dataset and LocateAnything checkpoint have been checked.
+The destination should not receive a manually assembled subset. Clone the exact
+Git commit and let `scripts/bootstrap_machine.sh download` fetch the exact model
+and dataset commits, patch the pinned Eagle checkout, validate archives, and
+materialize the data. Then follow
+`docs/A100_8GPU_FULL_SCALE_RUNBOOK.md` from preflight through evaluation.
+
+Source datasets retain their own licenses. Keep the Hub repository private until
+redistribution terms have been reviewed.

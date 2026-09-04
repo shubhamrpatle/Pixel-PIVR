@@ -24,6 +24,40 @@ DOTA_CLASSES = (
     "helipad",
 )
 
+DIOR_PROMPT_NAMES = {
+    "baseballfield": "baseball field",
+    "basketballcourt": "basketball court",
+    "golffield": "golf field",
+    "groundtrackfield": "ground track field",
+    "storagetank": "storage tank",
+    "tenniscourt": "tennis court",
+    "trainstation": "train station",
+}
+
+DETECTION_ONTOLOGIES = {
+    "DIOR": {
+        "name": "dior_raw_20_class",
+        "classes": DIOR_CLASSES,
+        "class_prompts": {
+            value: DIOR_PROMPT_NAMES.get(value, value) for value in DIOR_CLASSES
+        },
+        # Preserve official labels for scoring while accepting the readable
+        # forms used by the established LocateAnything evaluation prompts.
+        "label_aliases": {
+            display: raw for raw, display in DIOR_PROMPT_NAMES.items()
+        },
+    },
+    "DOTAv2": {
+        "name": "dotav2_raw_18_class",
+        "classes": DOTA_CLASSES,
+        "class_prompts": {value: value for value in DOTA_CLASSES},
+        # Match the established LA evaluator's only unambiguous DOTA alias.
+        # A generic "vehicle" prediction is intentionally not assigned to either
+        # small vehicle or large vehicle.
+        "label_aliases": {"airplane": "plane"},
+    },
+}
+
 
 def rows(paths: Iterable[Path]) -> Iterable[dict[str, Any]]:
     for path in paths:
@@ -47,8 +81,25 @@ def write_rows(path: Path, values: Iterable[dict[str, Any]]) -> int:
 
 
 def detection_rows(paths: list[Path], benchmark: str) -> Iterable[dict[str, Any]]:
-    classes = DIOR_CLASSES if benchmark == "DIOR" else DOTA_CLASSES
+    try:
+        ontology = DETECTION_ONTOLOGIES[benchmark]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported detection benchmark: {benchmark}") from exc
+    classes = tuple(ontology["classes"])
+    class_set = set(classes)
     for index, row in enumerate(rows(paths)):
+        gt = []
+        for object_index, obj in enumerate(row.get("objects", [])):
+            # The package keeps a convenience class_name field for cross-dataset
+            # analysis, but fair benchmark scoring follows the original ontology.
+            label = str(obj.get("raw_class_name") or obj.get("class_name") or "").strip()
+            if label not in class_set:
+                raise ValueError(
+                    f"{benchmark} object {object_index} in image "
+                    f"{row.get('image_id', index)!r} has label {label!r}, which is "
+                    f"outside ontology {ontology['name']}"
+                )
+            gt.append({"label": label, "hbox": obj["hbox"]})
         yield {
             "sample_key": f"{benchmark}:detection:{row.get('image_id', index)}",
             "image_id": str(row.get("image_id", index)),
@@ -56,10 +107,11 @@ def detection_rows(paths: list[Path], benchmark: str) -> Iterable[dict[str, Any]
             "task": "detection",
             "benchmark": benchmark,
             "classes": list(classes),
-            "gt": [
-                {"label": obj["class_name"], "hbox": obj["hbox"]}
-                for obj in row.get("objects", [])
-            ],
+            "class_ontology": ontology["name"],
+            "gt_label_field": "raw_class_name",
+            "class_prompts": dict(ontology["class_prompts"]),
+            "label_aliases": dict(ontology["label_aliases"]),
+            "gt": gt,
             "gt_coordinate_space": "pixel",
         }
 

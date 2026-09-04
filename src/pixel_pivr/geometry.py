@@ -37,6 +37,38 @@ def point_centered_crop(
     return x1, y1, x1 + side, y1 + side
 
 
+def resize_local_point(
+    point: Sequence[float],
+    source_size: Sequence[int],
+    output_size: Sequence[int],
+) -> list[float]:
+    """Map a point from a source crop into its resized local-view frame."""
+    source_width, source_height = (max(1, int(value)) for value in source_size)
+    output_width, output_height = (max(1, int(value)) for value in output_size)
+    return [
+        float(point[0]) * output_width / source_width,
+        float(point[1]) * output_height / source_height,
+    ]
+
+
+def local_hbox_to_global(
+    hbox: Sequence[float],
+    crop_xyxy: Sequence[int],
+    local_size: Sequence[int],
+) -> list[float]:
+    """Undo local-view resizing and translate an HBB into image coordinates."""
+    left, top, right, bottom = (int(value) for value in crop_xyxy)
+    local_width, local_height = (max(1, int(value)) for value in local_size)
+    scale_x = (right - left) / float(local_width)
+    scale_y = (bottom - top) / float(local_height)
+    return [
+        float(hbox[0]) * scale_x + left,
+        float(hbox[1]) * scale_y + top,
+        float(hbox[2]) * scale_x + left,
+        float(hbox[3]) * scale_y + top,
+    ]
+
+
 def point_address_prompt(
     label: str, point: Sequence[float], width: int, height: int
 ) -> str:
@@ -47,6 +79,45 @@ def point_address_prompt(
         f"In Image 2, point <box><{x}><{y}></box> addresses one {label}. "
         f"Return exactly one box for that {label} in Image 2 coordinates. "
         f"If no {label} contains the address point, return None."
+    )
+
+
+def cached_feature_point_prompt(
+    label: str, point: Sequence[float], width: int, height: int
+) -> str:
+    """Training-matched local-completeness prompt for pixel re-encoding."""
+    x, y = point_to_norm(point, width, height)
+    return (
+        f"Locate the single {label} containing point <box><{x}><{y}></box> "
+        "in the local view. Return its complete horizontal box, or None if "
+        "the complete boundary is unavailable."
+    )
+
+
+def global_fallback_point_prompt(
+    label: str, point: Sequence[float], width: int, height: int
+) -> str:
+    """Training-matched retry prompt in full-image coordinates."""
+    x, y = point_to_norm(point, width, height)
+    return (
+        f"Locate the single {label} containing point <box><{x}><{y}></box> "
+        "in the global image. Return its horizontal box, or None if absent."
+    )
+
+
+def box_touches_frame(
+    hbox: Sequence[float], width: int, height: int, margin: float
+) -> bool:
+    """Return whether a predicted boundary is too close to a crop boundary."""
+    if len(hbox) != 4:
+        raise ValueError(f"Expected HBB [x1, y1, x2, y2], got {hbox!r}")
+    margin = max(0.0, float(margin))
+    x1, y1, x2, y2 = map(float, hbox)
+    return (
+        x1 <= margin
+        or y1 <= margin
+        or x2 >= float(width) - margin
+        or y2 >= float(height) - margin
     )
 
 
@@ -205,4 +276,3 @@ def precision_recall_f1(tp: int, fp: int, fn: int) -> dict[str, float]:
     recall = tp / (tp + fn) if tp + fn else 0.0
     f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
     return {"precision": precision, "recall": recall, "f1": f1}
-

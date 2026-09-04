@@ -1,0 +1,61 @@
+{
+  "claim_boundary": "Matched 16K/4K mechanism pilot; no benchmark or SOTA claim before full evaluation.",
+  "dataset": {
+    "benchmark_holdout_overlap": 0,
+    "crop_side_pixels": 380,
+    "exact_local_pngs_train": 6350,
+    "exact_local_pngs_validation": 395,
+    "fallback_records_train": 111,
+    "local_negative_train": 672,
+    "local_positive_train": 5678,
+    "target_truncation": 0,
+    "train_records": 16000,
+    "train_validation_image_overlap": 0,
+    "validation_records": 1000
+  },
+  "exact_loader": {
+    "errors": 0,
+    "per_image_premerge_patch_token_limit": 6000,
+    "maximum_post_mtp_sequence_tokens": 2573,
+    "records_checked": 17000,
+    "sequence_limit": 8192,
+    "supervised_tokens": 2844793
+  },
+  "mechanism": {
+    "local_pixel_source": "independent lossless point-centred crop",
+    "local_visual_path": "MoonViT -> native 2x2 merge -> released projector",
+    "projector_parameters": "frozen and shared with the global path",
+    "qwen_lora_rank": 16,
+    "trainable_parameters": 29933568,
+    "vision_parameters": "frozen"
+  },
+  "representative_two_image_sample": {
+    "global_moonvit_grid": [
+      74,
+      74
+    ],
+    "global_projected_tokens": 1369,
+    "local_moonvit_grid": [
+      28,
+      28
+    ],
+    "local_projected_tokens": 196,
+    "source_image_size": [
+      1024,
+      1024
+    ],
+    "total_visual_tokens": 1565
+  },
+  "status": "passed",
+  "training_smoke": {
+    "final_training_loss": 1.2659390158951283,
+    "global_records_per_step": 4,
+    "gradient_accumulation": 2,
+    "local_reentry_exposures": 2,
+    "optimizer_steps": 3,
+    "peak_gpu_mb": 18990.07763671875,
+    "record_exposures": 12,
+    "validation_loss": 2.1617067754268646,
+    "world_size": 2
+  }
+}

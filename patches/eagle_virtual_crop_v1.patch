@@ -1,0 +1,119 @@
+diff --git a/Embodied/eaglevl/train/tools.py b/Embodied/eaglevl/train/tools.py
+index a91027a..3051499 100644
+--- a/Embodied/eaglevl/train/tools.py
++++ b/Embodied/eaglevl/train/tools.py
+@@ -23,6 +23,7 @@ from typing import List
+ 
+ import torch
+ import torch.distributed as dist
++from PIL import Image
+ from pynvml import (
+     NVML_TEMPERATURE_GPU,
+     nvmlDeviceGetHandleByIndex,
+@@ -315,6 +316,48 @@ def auto_thinking_prompt_handler(conversations):
+     return conversations
+ 
+ 
++# PIXEL_PIVR_VIRTUAL_CROP_V1
++def _pixel_pivr_virtual_crop(image_data, media_root):
++    """Materialize a validated Pixel-PIVR crop without storing duplicate images."""
++    source_path = image_data.get("path")
++    crop = image_data.get("crop_xyxy")
++    resize_hw = image_data.get("resize_hw")
++    schema = image_data.get("schema")
++    resample = str(image_data.get("resample", "")).lower()
++    if schema != "pixel-pivr-virtual-crop-v1":
++        raise ValueError(f"Unsupported virtual_crop schema: {schema!r}")
++    if not isinstance(source_path, str) or not source_path:
++        raise ValueError("virtual_crop image requires a non-empty 'path'")
++    if not osp.isabs(source_path):
++        source_path = osp.join(media_root, source_path)
++    if (
++        not isinstance(crop, list)
++        or len(crop) != 4
++        or any(isinstance(value, bool) or not isinstance(value, int) for value in crop)
++    ):
++        raise ValueError("virtual_crop requires integer crop_xyxy=[left, top, right, bottom]")
++    if (
++        not isinstance(resize_hw, list)
++        or len(resize_hw) != 2
++        or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in resize_hw)
++    ):
++        raise ValueError("virtual_crop requires positive integer resize_hw=[height, width]")
++    if resample != "lanczos":
++        raise ValueError(f"Pixel-PIVR virtual_crop requires Lanczos, got {resample!r}")
++    left, top, right, bottom = crop
++    with Image.open(source_path) as source:
++        width, height = source.size
++        if not (0 <= left < right <= width and 0 <= top < bottom <= height):
++            raise ValueError(
++                f"virtual_crop is outside {source_path}: crop={crop}, image_size={(width, height)}"
++            )
++        local = source.convert("RGB").crop((left, top, right, bottom))
++        target_height, target_width = resize_hw
++        if local.size != (target_width, target_height):
++            local = local.resize((target_width, target_height), Image.Resampling.LANCZOS)
++        return local
++
++
+ def process_multimodal_sample(sample, media_root, max_frames, target_fps, video_total_pixels, auto_thinking_handler=False):
+     """
+     Process a multimodal data sample and format it into the final message list.
+@@ -355,6 +398,9 @@ def process_multimodal_sample(sample, media_root, max_frames, target_fps, video_
+                 if 'video' in img:  # Support the case where video frames are treated as images
+                     video_data.append(osp.join(media_root, img['video']))
+                 else:  # Handle lmdb-format images
++                    if img.get('virtual_crop'):
++                        image_data.append(_pixel_pivr_virtual_crop(img, media_root))
++                        continue
+                     img_copy = img.copy()
+                     if 'lmdb_file' in img_copy:
+                         img_copy['lmdb_file'] = osp.join(media_root, img_copy['lmdb_file'])
+diff --git a/Embodied/eaglevl/train/locany_finetune_magi_stream.py b/Embodied/eaglevl/train/locany_finetune_magi_stream.py
+index 5f9b849..b635aa2 100644
+--- a/Embodied/eaglevl/train/locany_finetune_magi_stream.py
++++ b/Embodied/eaglevl/train/locany_finetune_magi_stream.py
+@@ -486,11 +486,19 @@ class LazySupervisedDatasetMTP(Dataset):
+                 ) for img in image_inputs
+             ]
+         
++        strict_coverage = os.environ.get(
++            "LOCANY_STRICT_COVERAGE", ""
++        ).strip().lower() in {"1", "true", "yes", "on"}
+         inputs = self.processor(
+             text=message_text, images=image_inputs, videos=video_inputs,
+-            return_tensors="pt", padding=False, truncation=True
++            return_tensors="pt", padding=False, truncation=not strict_coverage
+         )
+         input_ids = inputs["input_ids"][0]
++        if strict_coverage and input_ids.numel() > self.max_length:
++            raise ValueError(
++                f"Native sequence has {input_ids.numel()} tokens, exceeding "
++                f"the strict limit {self.max_length}; refusing truncation"
++            )
+ 
+         if "pixel_values" not in inputs:
+             pixel_values = torch.zeros((4, 3, 14, 14), dtype=torch.float32)
+@@ -502,6 +510,11 @@ class LazySupervisedDatasetMTP(Dataset):
+             image_flags = torch.tensor([len(inputs["image_grid_hws"])], dtype=torch.long)
+ 
+         labels_dict = self.get_targets_flag_with_mtp(input_ids)
++        if strict_coverage and labels_dict["input_ids"].numel() > self.max_length:
++            raise ValueError(
++                f"MTP sequence has {labels_dict['input_ids'].numel()} tokens, exceeding "
++                f"the strict limit {self.max_length}; refusing truncation"
++            )
+         
+         return dict(
+             input_ids=labels_dict["input_ids"],
+@@ -533,6 +546,10 @@ class LazySupervisedDatasetMTP(Dataset):
+             except Exception as e:
+                 tb = traceback.format_exc()
+                 logger.warning(f"[{self.ds_name}] idx {real_idx} failed: {e}\n{tb}")
++                if os.environ.get("LOCANY_STRICT_COVERAGE", "").strip().lower() in {
++                    "1", "true", "yes", "on"
++                }:
++                    raise RuntimeError(f"[{self.ds_name}] strict coverage refuses sample replacement") from e
+                 retry_count += 1
+         
+         raise RuntimeError(f"[{self.ds_name}] Failed after 10 retries")

@@ -30,6 +30,42 @@ for path in "$PYTHON_BIN" "$MODEL_PATH" "$EAGLE_ROOT" "$DATA_ROOT"; do
   [[ -e "$path" ]] || { echo "Missing configured path: $path" >&2; exit 2; }
 done
 
+if [[ -n "${ARCHITECTURE_CONTRACT:-}" ]]; then
+  "$PYTHON_BIN" - "$DATA_ROOT/manifest.json" \
+    "$ARCHITECTURE_CONTRACT" "${VISUAL_CONTEXT:-}" \
+    "${SOURCE_CROP_SIDE:-}" "${LOCAL_INPUT_SIDE:-}" \
+    "${MAGNIFIED_ROI_PIXELS:-}" "${IMAGE_TOKEN_LIMIT:-}" \
+    "${MAX_SEQUENCE:-}" "${LOSS_BALANCING:-}" <<'PY'
+import json, sys
+from pathlib import Path
+
+manifest_path = Path(sys.argv[1])
+if not manifest_path.is_file():
+    raise SystemExit(f"Missing dataset manifest: {manifest_path}")
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+expected = {
+    "architecture": "pixel_crop_144to384_v2",
+    "visual_context": "pixel_reencoded",
+    "source_crop": "144",
+    "local_input": "384",
+    "magnified_roi": "384",
+    "image_tokens": "6000",
+    "sequence": "32768",
+    "loss_balancing": "source_query_task",
+}
+actual = dict(zip(expected, sys.argv[2:]))
+if actual != expected:
+    raise SystemExit(f"Full-scale architecture contract mismatch: {actual} != {expected}")
+if manifest.get("schema_version") != "pixel-pivr-hf-hbb-magnified-v2":
+    raise SystemExit(f"Wrong dataset schema: {manifest.get('schema_version')!r}")
+crop = manifest.get("pixel_reentry") or {}
+if crop.get("source_crop_side_pixels") != 144 or crop.get("local_input_side_pixels") != 384:
+    raise SystemExit(f"Wrong dataset crop contract: {crop}")
+if crop.get("fallback_edge_margin_pixels") != 2.0:
+    raise SystemExit(f"Wrong dataset fallback edge margin: {crop}")
+PY
+fi
+
 load_recipe_annotations() {
   local recipe="$1"
   "$PYTHON_BIN" - "$recipe" "$DATA_ROOT" <<'PY'
@@ -121,6 +157,9 @@ export HF_HOME="${HF_HOME:-$ROOT/.cache/huggingface}"
 export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$ROOT/.cache/torch_extensions}"
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$ROOT/.cache/triton}"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 mkdir -p "$HF_HOME" "$TORCH_EXTENSIONS_DIR" "$TRITON_CACHE_DIR" "$ROOT/runs/logs"
 
 gpu_uuid() {
@@ -158,17 +197,26 @@ common_args() {
     --expected-train-records "${EXPECTED_TRAIN_RECORDS:-0}"
     --expected-validation-records "${EXPECTED_VALIDATION_RECORDS:-0}"
     --lora-rank "${LORA_RANK:-16}"
+    --loss-balancing "${LOSS_BALANCING:-none}"
     --image-token-limit "${IMAGE_TOKEN_LIMIT:-1024}"
-    --max-sequence "${MAX_SEQUENCE:-8192}"
+    --max-sequence "${MAX_SEQUENCE:-32768}"
     --visual-context "${VISUAL_CONTEXT:-pixel_reencoded}"
-    --magnified-roi-pixels "${MAGNIFIED_ROI_PIXELS:-380}"
+    --magnified-roi-pixels "${MAGNIFIED_ROI_PIXELS:-384}"
     --magnified-roi-stride "${MAGNIFIED_ROI_STRIDE:-1}"
+    --multiscale-roi-pixels "${MULTISCALE_ROI_PIXELS:-196,378,756}"
+    --multiscale-target-patches "${MULTISCALE_TARGET_PATCHES:-27}"
+    --multiscale-fusion-hidden "${MULTISCALE_FUSION_HIDDEN:-128}"
+    --multiscale-preferred-scale "${MULTISCALE_PREFERRED_SCALE:-1}"
     --gradient-accumulation "$GRADIENT_ACCUMULATION"
     --allowed-padding-records "$PADDING_RECORDS"
     --sample-order "${SAMPLE_ORDER:-shuffled}"
     --learning-rate "${LEARNING_RATE:-1e-5}"
+    --weight-decay "${WEIGHT_DECAY:-0.01}"
+    --max-grad-norm "${MAX_GRAD_NORM:-1.0}"
     --checkpoint-steps "${CHECKPOINT_STEPS:-500}"
+    --keep-recent-checkpoints "${KEEP_RECENT_CHECKPOINTS:-1}"
     --eval-steps "${EVAL_STEPS:-500}"
+    --log-steps "${LOG_STEPS:-50}"
     --validation-records "${VALIDATION_RECORDS:-0}"
     --validation-sampling "${VALIDATION_SAMPLING:-stratified_files}"
     --workers "${WORKERS:-2}"
@@ -193,8 +241,39 @@ common_args() {
 run_torch() {
   local destination="$1" steps="$2" smoke_flag="$3"
   local warmup_steps="${WARMUP_STEPS:-100}"
+  local saved_wandb_project="${WANDB_PROJECT:-}"
+  local saved_validation_records="${VALIDATION_RECORDS:-0}"
+  local saved_expected_train_records="${EXPECTED_TRAIN_RECORDS:-0}"
+  local saved_padding_records="$PADDING_RECORDS"
+  local saved_train_records="$TRAIN_RECORDS"
+  local -a saved_train_data_args=("${TRAIN_DATA_ARGS[@]}")
   [[ -n "$smoke_flag" ]] && warmup_steps=1
+  # Smoke runs use timestamped output directories and must not append their
+  # diagnostic steps to the stable W&B run reserved for the complete experiment.
+  [[ -n "$smoke_flag" ]] && WANDB_PROJECT=""
+  [[ -n "$smoke_flag" ]] && VALIDATION_RECORDS="${SMOKE_VALIDATION_RECORDS:-8}"
+  if [[ -n "$smoke_flag" ]]; then
+    local smoke_records=$((steps * GLOBAL_BATCH))
+    local smoke_recipe_root="$destination/hard_smoke_data"
+    mkdir -p "$smoke_recipe_root"
+    "$PYTHON_BIN" "$ROOT/tools/build_hard_smoke_recipe.py" \
+      --jsonl "${TRAIN_DATA_ARGS[@]}" \
+      --output "$smoke_recipe_root" \
+      --records "$smoke_records"
+    mapfile -t TRAIN_DATA_ARGS < <(
+      load_recipe_annotations "$smoke_recipe_root/hard_smoke_recipe.json"
+    )
+    TRAIN_RECORDS="$smoke_records"
+    EXPECTED_TRAIN_RECORDS="$smoke_records"
+    PADDING_RECORDS=0
+  fi
   common_args
+  WANDB_PROJECT="$saved_wandb_project"
+  VALIDATION_RECORDS="$saved_validation_records"
+  EXPECTED_TRAIN_RECORDS="$saved_expected_train_records"
+  PADDING_RECORDS="$saved_padding_records"
+  TRAIN_RECORDS="$saved_train_records"
+  TRAIN_DATA_ARGS=("${saved_train_data_args[@]}")
   TRAIN_ARGS+=(
     --output "$destination"
     --max-steps "$steps"
@@ -216,10 +295,11 @@ case "$MODE" in
       --model "$MODEL_PATH" \
       --eagle-root "$EAGLE_ROOT" \
       --image-token-limit "${IMAGE_TOKEN_LIMIT:-1024}" \
-      --max-sequence "${MAX_SEQUENCE:-8192}" \
+      --max-sequence "${MAX_SEQUENCE:-32768}" \
       --visual-context "${VISUAL_CONTEXT:-pixel_reencoded}" \
-      --magnified-roi-pixels "${MAGNIFIED_ROI_PIXELS:-380}" \
+      --magnified-roi-pixels "${MAGNIFIED_ROI_PIXELS:-384}" \
       --magnified-roi-stride "${MAGNIFIED_ROI_STRIDE:-1}"
+      --multiscale-target-patches "${MULTISCALE_TARGET_PATCHES:-27}"
     )
     if [[ -n "${HOLDOUT_HASHES:-}" ]]; then
       [[ -f "$HOLDOUT_HASHES" ]] || {
@@ -236,6 +316,7 @@ case "$MODE" in
     echo "Pixel-PIVR inputs are present; $WORLD_SIZE GPUs are free."
     echo "Global records/update: $GLOBAL_BATCH; accumulation/rank: $GRADIENT_ACCUMULATION"
     echo "Train records: $TRAIN_RECORDS; explicit padding: $PADDING_RECORDS; one-pass steps: $ONE_PASS_STEPS"
+    echo "Loss balancing: ${LOSS_BALANCING:-none}"
     echo "Validation records: $VALIDATION_RECORD_COUNT; monitor: ${VALIDATION_RECORDS:-0} (${VALIDATION_SAMPLING:-stratified_files})"
     ;;
   smoke)
@@ -246,6 +327,28 @@ case "$MODE" in
       echo "Smoke failed to produce done.json: $destination" >&2
       exit 1
     }
+    "$PYTHON_BIN" - "$RUN_CONFIG" "$destination/done.json" \
+      "$SMOKE_DIR/latest_success.json" <<'PY'
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+config, done, output = map(Path, sys.argv[1:])
+payload = {
+    "schema_version": "pixel-pivr-smoke-receipt-v1",
+    "run_config": str(config.resolve()),
+    "run_config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
+    "done_json": str(done.resolve()),
+}
+output.parent.mkdir(parents=True, exist_ok=True)
+temporary = output.with_suffix(output.suffix + f".tmp.{os.getpid()}")
+temporary.write_text(
+    json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+os.replace(temporary, output)
+PY
     echo "Smoke passed: $destination"
     ;;
   train)

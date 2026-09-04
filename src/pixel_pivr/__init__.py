@@ -2,8 +2,10 @@
 
 from .decoder import AddressedCrop, PixelPIVRWaveDecoder
 from .magnified_decoder import MagnifiedPreProjectorWaveDecoder
+from .adaptive_multiscale_decoder import AdaptiveMultiScaleWaveDecoder
 
 __all__ = [
+    "AdaptiveMultiScaleWaveDecoder",
     "AddressedCrop",
     "PixelPIVRWaveDecoder",
     "MagnifiedPreProjectorWaveDecoder",

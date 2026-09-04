@@ -1,4 +1,4 @@
-# Versions used by the matched 16K/4K experiment.
+# Versions pinned for the magnified-v2 pilot and 8 x A100 full-scale release.
 torch==2.5.1
 transformers==4.57.1
 peft==0.12.0
@@ -8,9 +8,26 @@ safetensors==0.8.0
 accelerate==1.5.2
 deepspeed==0.15.4
 torchvision==0.20.1
+liger-kernel==0.3.1
+datasets==5.0.0
+fsspec[http]==2026.4.0
 einops==0.8.2
 timm==1.0.27
 sentencepiece==0.2.0
+huggingface_hub[cli]==0.36.2
+tokenizers==0.22.0
+nvidia-ml-py==13.610.43
+python-dotenv==1.2.2
+opencv-python-headless==4.11.0.86
+decord==0.6.0
+av==17.1.0
+lmdb==1.7.5
+einops-exts==0.0.4
+shortuuid==1.0.13
+packaging==26.2
+ninja==1.13.0
+regex==2026.5.9
+requests==2.34.2
 
 # Optional experiment tracking. The code runs without it.
 wandb==0.27.2

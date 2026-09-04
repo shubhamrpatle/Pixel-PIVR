@@ -1,73 +1,116 @@
-# Hugging Face Dataset Release
+# Hugging Face Magnified-v2 Release
 
-The full-scale HBB corpus is packaged from the independently verified
-`pixel_pivr_type2_hbb_full_v1` curriculum. The packager rewrites machine-local
-image references, content-addresses every image, and separates train,
-validation, and test by image SHA-256.
+The full-scale release is `pixel-pivr-hf-hbb-magnified-v2`. It is generated from
+the leak-free `pixel_pivr_type2_hbb_full_v1` curriculum, but expands every Round-2
+row into strict local-first 144-to-384 pixel re-entry supervision and any required
+observable global fallback.
 
-## Build
+Do not upload or train from the older `shubhampatle/Pixel-PIVR` repository. It is
+the earlier `pixel-pivr-hf-hbb-v1` schema and is not the final magnified variant.
 
-```bash
-cd /absolute/path/to/Pixel-PIVR
-export PACKAGE_ROOT=/absolute/path/to/Pixel-PIVR-HF
+## Build the materialized package
 
-python tools/package_hf_dataset.py plan
-python tools/package_hf_dataset.py build \
-  --output "$PACKAGE_ROOT" \
-  --link-mode hardlink
-python tools/package_hf_dataset.py verify \
-  --output "$PACKAGE_ROOT"
-```
-
-`hardlink` stores no second copy of image bytes when source and destination are
-on the same filesystem. Use `--link-mode copy` for a physically independent
-release directory.
-
-Run an expensive byte-level image audit before publication:
+Use a new, empty destination. The tool refuses to overwrite an existing package.
 
 ```bash
-python tools/package_hf_dataset.py verify \
-  --output "$PACKAGE_ROOT" \
+cd /path/to/Pixel-PIVR
+source .venv/bin/activate
+
+export MATERIALIZED=/path/to/Pixel-PIVR-HF-v2-release
+python tools/package_hf_magnified_v2.py plan
+python tools/package_hf_magnified_v2.py build \
+  --output "$MATERIALIZED" \
+  --existing-image-root /path/to/verified/Pixel-PIVR-HF-v1 \
+  --trust-record-hashes
+
+python tools/package_hf_magnified_v2.py verify \
+  --output "$MATERIALIZED" \
   --verify-image-hashes
 ```
 
-## Upload
+The final verification reads every image byte. It also checks exact containment,
+the frozen two-pixel edge-retry margin, box-only Round-2 grammar, local/global
+fallback pairing, recipe counts, image inventory, all metadata checksums, and
+zero train/validation/test image-hash overlap.
 
-Authenticate as the owner of the requested namespace, create the dataset repo,
-and upload the generated directory:
+The test package uses 16,154 VRSBench-VG queries. This is intentional: five of
+the 16,159 official queries share image hashes with the independent validation
+pool and are excluded to keep checkpoint selection disjoint from reported test
+results. The manifest records the exact retained count.
+
+## Build the low-file-count upload bundle
+
+Uploading more than 100,000 individual image paths is slow and fragile. The Hub
+artifact therefore carries deterministic uncompressed tar shards while retaining
+the logical `images/...` checksums and paths.
 
 ```bash
-source .venv/bin/activate
+export BUNDLE=/path/to/Pixel-PIVR-Magnified-v2-upload
+python tools/build_hf_upload_bundle.py build \
+  --source "$MATERIALIZED" \
+  --output "$BUNDLE" \
+  --archive-gib 4
+
+python tools/build_hf_upload_bundle.py verify \
+  --output "$BUNDLE" \
+  --verify-member-hashes
+```
+
+The bundle verifier reads every archive member, checks member sizes and SHA-256,
+and proves that each logical image appears exactly once.
+
+## Upload and verify the remote snapshot
+
+Keep the repository private until source-dataset redistribution terms have been
+reviewed.
+
+```bash
 hf auth login
-hf repo create shubhampatle/Pixel-PIVR --repo-type dataset --private --exist-ok
-hf upload-large-folder shubhampatle/Pixel-PIVR \
-  "$PACKAGE_ROOT" \
-  --repo-type dataset \
-  --num-workers 8
+export BUNDLE_ROOT="$BUNDLE"
+export HF_REPO=shubhampatle/Pixel-PIVR-Magnified-v2
+export PYTHON_BIN="$PWD/.venv/bin/python"
+export HF_BIN="$PWD/.venv/bin/hf"
+bash scripts/publish_hf_dataset.sh check
+bash scripts/publish_hf_dataset.sh upload | tee hf_upload_and_verification.log
 ```
 
-`upload-large-folder` records resumable task state inside the local folder. If
-the network or terminal stops, rerun the same command to continue.
+The guarded publisher refuses the legacy repository name, verifies every local
+archive member before upload, creates the new repository as private, uses the
+resumable `upload-large-folder` path, resolves the resulting immutable commit,
+and compares the complete remote path/size/hash inventory. Rerun the identical
+`upload` command after a network or terminal interruption. It does not need
+`--resume-download`.
 
-The source datasets retain their individual licenses. Resolve redistribution
-permission for every included image source before making the repository public.
-Keep the initial Hub repository private while completing that review.
-
-## Use on a new machine
-
-The code repository consumes the package without path rewriting:
+Resolve the immutable Hub commit and compare the complete remote path, size, and
+cryptographic digest inventory with the local bundle:
 
 ```bash
-hf download shubhampatle/Pixel-PIVR \
-  --repo-type dataset \
-  --local-dir /absolute/path/Pixel-PIVR-data
+DATA_REVISION="$(python - <<'PY'
+from huggingface_hub import HfApi
+print(HfApi().dataset_info('shubhampatle/Pixel-PIVR-Magnified-v2').sha)
+PY
+)"
 
-cd /absolute/path/Pixel-PIVR
-cp configs/full_scale.env.example configs/full_scale.env
-# Set DATA_ROOT to /absolute/path/Pixel-PIVR-data and edit the other four paths.
-PIPELINE_CONFIG="$PWD/configs/full_scale.env" \
-  bash scripts/run_full_pipeline.sh preflight
+DATA_REVISION="$DATA_REVISION" \
+  bash scripts/publish_hf_dataset.sh verify-remote
+
+printf 'DATA_REVISION=%s\n' "$DATA_REVISION"
 ```
 
-The Stage 1, Stage 2, validation, and test paths are read from package recipes.
-No test annotation is accepted by the training orchestration.
+Do not issue a remote-training handoff unless this command writes a passed
+`remote_verification.json`.
+
+## Download on the A100 node
+
+Use the exact verified revision, never `main`:
+
+```bash
+export WORK_ROOT=/path/to/pixel-pivr-assets
+export DATA_REPO=shubhampatle/Pixel-PIVR-Magnified-v2
+export DATA_REVISION=<VERIFIED_40_CHARACTER_HF_COMMIT>
+bash scripts/bootstrap_machine.sh download
+```
+
+Bootstrap validates all archives, materializes images atomically, verifies every
+materialized image SHA-256, and writes `download_receipt.json`. Reusing the same
+paths and command safely resumes or revalidates the transfer.

@@ -7,6 +7,10 @@ from typing import Any
 
 import torch
 
+from .attention import (
+    locateanything_attention_dispatch,
+    verify_locateanything_attention,
+)
 from .lora import load_adapter_checkpoint
 
 
@@ -27,6 +31,7 @@ class LocateAnythingPixelPIVRWorker:
         device: str = "cuda",
         dtype: str = "bfloat16",
         local_files_only: bool = True,
+        allow_unsynchronized_adapter: bool = False,
     ) -> None:
         from transformers import AutoConfig, AutoModel, AutoProcessor, AutoTokenizer
 
@@ -47,18 +52,25 @@ class LocateAnythingPixelPIVRWorker:
         config._attn_implementation_autoset = False
         config.text_config._attn_implementation = "sdpa"
         config.text_config._attn_implementation_autoset = False
-        config.vision_config._attn_implementation = choose_vision_attention()
+        vision_attention = choose_vision_attention()
+        config.vision_config._attn_implementation = vision_attention
         config.vision_config._attn_implementation_autoset = False
+        attention_dispatch = locateanything_attention_dispatch(vision_attention)
         self.model = AutoModel.from_pretrained(
             model_path,
             config=config,
-            torch_dtype=self.dtype,
+            dtype=self.dtype,
             trust_remote_code=True,
             local_files_only=bool(local_files_only),
             low_cpu_mem_usage=True,
-            attn_implementation="sdpa",
+            attn_implementation=attention_dispatch,
         ).to(device)
-        self.checkpoint = load_adapter_checkpoint(self.model, adapter_path)
+        verify_locateanything_attention(self.model, vision_attention)
+        self.checkpoint = load_adapter_checkpoint(
+            self.model,
+            adapter_path,
+            allow_unsynchronized_distributed=allow_unsynchronized_adapter,
+        )
         self.model.eval()
 
     @torch.no_grad()

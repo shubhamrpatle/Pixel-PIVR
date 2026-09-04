@@ -14,7 +14,7 @@ from .magnified_roi import (
     extract_magnified_preprojector_roi,
     insert_virtual_image,
 )
-from .modeling import chunked_cross_entropy
+from .modeling import chunked_cross_entropy, weighted_training_objective
 
 
 REENTRY_ROUTES = {
@@ -175,12 +175,12 @@ class MagnifiedPreProjectorTrainingModel(nn.Module):
             labels.unsqueeze(0),
             causal.lm_head.weight,
         )
-        return native, {
-            "loss": float(native.detach().float()),
-            "native_loss": float(native.detach().float()),
+        objective, metrics = weighted_training_objective(native, sample)
+        metrics.update({
             "global_visual_tokens": float(cache.projected_global.shape[0]),
             "local_visual_tokens": float(roi_tokens),
             "local_effective_pixels_h": float(effective_h),
             "local_effective_pixels_w": float(effective_w),
             "moonvit_encodes": 1.0,
-        }
+        })
+        return objective, metrics

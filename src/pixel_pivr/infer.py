@@ -15,21 +15,49 @@ from PIL import Image
 
 from .decoder import AddressedCrop, PixelPIVRWaveDecoder
 from .magnified_decoder import MagnifiedPreProjectorWaveDecoder
+from .adaptive_multiscale_decoder import AdaptiveMultiScaleWaveDecoder
+from .train import ADAPTIVE_CONTEXT, parse_int_csv
 from .geometry import (
+    box_touches_frame,
     canonical_label,
+    cached_feature_point_prompt,
     class_nms,
     detection_counts,
     discovery_prompt,
+    global_fallback_point_prompt,
     hbox_iou,
+    local_hbox_to_global,
     parse_labeled_points,
     parse_single_hbb,
     point_address_prompt,
     point_centered_crop,
     point_inside_hbox,
     precision_recall_f1,
+    resize_local_point,
 )
 from .io import append_jsonl, atomic_json, count_jsonl
 from .worker import LocateAnythingPixelPIVRWorker
+
+
+def row_label(value: Any, row: Mapping[str, Any]) -> str:
+    """Canonicalize a label using aliases explicitly signed by the manifest."""
+    label = canonical_label(value)
+    aliases = {
+        canonical_label(source): canonical_label(target)
+        for source, target in (row.get("label_aliases") or {}).items()
+    }
+    return aliases.get(label, label)
+
+
+def row_class_prompts(classes: list[str], row: Mapping[str, Any]) -> list[str]:
+    """Return model-facing names while retaining canonical scoring classes."""
+    prompts = {
+        row_label(source, row): str(target).strip()
+        for source, target in (row.get("class_prompts") or {}).items()
+    }
+    if any(not value for value in prompts.values()):
+        raise ValueError("class_prompts contains an empty model-facing label")
+    return [prompts.get(label, label) for label in classes]
 
 
 def resolve_image(raw: str, data_root: Path) -> Path:
@@ -49,7 +77,7 @@ def supplied_points(
     output = []
     seen: set[tuple[str, int, int]] = set()
     for index, value in enumerate(row.get("points") or []):
-        label = canonical_label(value.get("label"))
+        label = row_label(value.get("label"), row)
         point = [float(item) for item in value["point"]]
         if coordinate_space == "normalized_0_1000":
             point = [point[0] / 1000.0 * width, point[1] / 1000.0 * height]
@@ -91,7 +119,7 @@ def normalize_ground_truth(row: Mapping[str, Any]) -> list[dict[str, Any]]:
             ]
         elif coordinate_space != "pixel":
             raise ValueError(f"Unsupported GT coordinate space: {coordinate_space}")
-        output.append({"label": canonical_label(target.get("label")), "hbox": box})
+        output.append({"label": row_label(target.get("label"), row), "hbox": box})
     return output
 
 
@@ -188,9 +216,21 @@ def run(args: argparse.Namespace) -> None:
         device=args.device,
         dtype=args.dtype,
         local_files_only=not args.allow_download,
+        allow_unsynchronized_adapter=args.allow_unsynchronized_adapter,
     )
     worker.processor.image_processor.in_token_limit = int(args.image_token_limit)
-    if args.visual_context == "preprojector_magnified_roi":
+    if args.visual_context == ADAPTIVE_CONTEXT:
+        decoder = AdaptiveMultiScaleWaveDecoder(
+            worker,
+            image_token_limit=args.image_token_limit,
+            prefix_cache_mode=args.prefix_cache_mode,
+            roi_pixels=args.multiscale_roi_pixels,
+            target_patches=args.multiscale_target_patches,
+            roi_stride=args.magnified_roi_stride,
+            fusion_hidden=args.multiscale_fusion_hidden,
+            preferred_scale=args.multiscale_preferred_scale,
+        )
+    elif args.visual_context == "preprojector_magnified_roi":
         decoder = MagnifiedPreProjectorWaveDecoder(
             worker,
             image_token_limit=args.image_token_limit,
@@ -203,6 +243,7 @@ def run(args: argparse.Namespace) -> None:
             worker,
             image_token_limit=args.image_token_limit,
             prefix_cache_mode=args.prefix_cache_mode,
+            geometry_prefix_mode=args.geometry_prefix_mode,
         )
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -237,9 +278,10 @@ def run(args: argparse.Namespace) -> None:
             image_path = resolve_image(str(row["image"]), args.data_root)
             image = Image.open(image_path).convert("RGB")
             width, height = image.size
-            classes = [canonical_label(value) for value in row.get("classes") or []]
+            classes = [row_label(value, row) for value in row.get("classes") or []]
             if not classes:
                 raise ValueError(f"{image_id} has no explicit classes")
+            prompt_classes = row_class_prompts(classes, row)
 
             points = supplied_points(row, width, height)
             point_answer = None
@@ -248,13 +290,15 @@ def run(args: argparse.Namespace) -> None:
                 started = time.perf_counter()
                 point_answer = worker.predict_points(
                     image,
-                    str(row.get("point_prompt") or discovery_prompt(classes)),
+                    str(row.get("point_prompt") or discovery_prompt(prompt_classes)),
                     max_new_tokens=args.point_max_new_tokens,
                     temperature=args.temperature,
                     top_p=args.top_p,
                 )
                 point_seconds = time.perf_counter() - started
                 points = parse_labeled_points(point_answer, width, height)
+                for point in points:
+                    point["label"] = row_label(point.get("label"), row)
             allowed = set(classes)
             points = [point for point in points if point["label"] in allowed]
             ground_truth = normalize_ground_truth(
@@ -298,8 +342,15 @@ def run(args: argparse.Namespace) -> None:
             branches: list[AddressedCrop] = []
             tasks: list[dict[str, Any]] = []
             for point in points:
-                if args.visual_context == "preprojector_magnified_roi":
-                    question = point_address_prompt(
+                if args.point_address_prompt_schema == "compact":
+                    point_prompt = cached_feature_point_prompt
+                else:
+                    point_prompt = point_address_prompt
+                if args.visual_context in {
+                    "preprojector_magnified_roi",
+                    ADAPTIVE_CONTEXT,
+                }:
+                    question = point_prompt(
                         str(point["label"]), point["point"], width, height
                     )
                     branches.append(
@@ -327,11 +378,21 @@ def run(args: argparse.Namespace) -> None:
                     )
                     left, top, _right, _bottom = crop_box
                     crop = image.crop(crop_box)
+                    source_crop_size = [crop.width, crop.height]
                     local_point = [
                         float(point["point"][0]) - left,
                         float(point["point"][1]) - top,
                     ]
-                    question = point_address_prompt(
+                    if args.local_resize_side:
+                        output_side = int(args.local_resize_side)
+                        local_point = resize_local_point(
+                            local_point, source_crop_size, [output_side, output_side]
+                        )
+                        crop = crop.resize(
+                            (output_side, output_side),
+                            resample=Image.Resampling.LANCZOS,
+                        )
+                    question = point_prompt(
                         str(point["label"]), local_point, crop.width, crop.height
                     )
                     branches.append(
@@ -347,6 +408,7 @@ def run(args: argparse.Namespace) -> None:
                             "local_point": local_point,
                             "crop_box": list(crop_box),
                             "crop_size": [crop.width, crop.height],
+                            "source_crop_size": source_crop_size,
                         }
                     )
 
@@ -362,31 +424,141 @@ def run(args: argparse.Namespace) -> None:
                 )
             raw_predictions = []
             refinements = []
-            for task, result in zip(tasks, decoded):
-                crop_width, crop_height = task["crop_size"]
-                prediction = parse_single_hbb(
-                    result["answer"], task["label"], crop_width, crop_height
+            fallback_branches: list[AddressedCrop] = []
+            fallback_tasks: list[dict[str, Any]] = []
+            for address_task, result in zip(tasks, decoded):
+                crop_width, crop_height = address_task["crop_size"]
+                local_prediction = parse_single_hbb(
+                    result["answer"], address_task["label"], crop_width, crop_height
                 )
                 accepted = False
-                if prediction is not None and point_inside_hbox(
-                    task["local_point"], prediction["hbox"]
-                ):
-                    if task["crop_box"] is not None:
-                        left, top, _right, _bottom = task["crop_box"]
-                        prediction["hbox"] = [
-                            prediction["hbox"][0] + left,
-                            prediction["hbox"][1] + top,
-                            prediction["hbox"][2] + left,
-                            prediction["hbox"][3] + top,
-                        ]
-                    prediction["point_id"] = task["point_id"]
-                    prediction["witness_point"] = task["global_point"]
-                    prediction["source"] = "pixel_pivr_constrained_pbd6"
-                    raw_predictions.append(prediction)
-                    accepted = True
-                refinements.append(
-                    {**task, **result, "accepted": accepted, "prediction": prediction}
+                global_prediction = None
+                contains_address = bool(
+                    local_prediction is not None
+                    and point_inside_hbox(
+                        address_task["local_point"], local_prediction["hbox"]
+                    )
                 )
+                touches_crop_edge = bool(
+                    args.global_fallback
+                    and address_task["crop_box"] is not None
+                    and local_prediction is not None
+                    and box_touches_frame(
+                        local_prediction["hbox"],
+                        crop_width,
+                        crop_height,
+                        args.fallback_edge_margin,
+                    )
+                )
+                needs_fallback = bool(
+                    args.global_fallback
+                    and args.visual_context == "pixel_reencoded"
+                    and address_task["crop_box"] is not None
+                    and (not contains_address or touches_crop_edge)
+                )
+                if contains_address and not needs_fallback:
+                    global_prediction = dict(local_prediction)
+                    if address_task["crop_box"] is not None:
+                        global_prediction["hbox"] = local_hbox_to_global(
+                            local_prediction["hbox"],
+                            address_task["crop_box"],
+                            address_task["crop_size"],
+                        )
+                    global_prediction["point_id"] = address_task["point_id"]
+                    global_prediction["witness_point"] = address_task["global_point"]
+                    global_prediction["source"] = "pixel_pivr_constrained_pbd6"
+                    raw_predictions.append(global_prediction)
+                    accepted = True
+                refinement = {
+                    **address_task,
+                    **result,
+                    "accepted": accepted,
+                    "local_prediction": local_prediction,
+                    "local_prediction_coordinate_space": "local_view_pixels",
+                    "local_contains_address": contains_address,
+                    "local_touches_crop_edge": touches_crop_edge,
+                    "global_fallback_requested": needs_fallback,
+                    "prediction": global_prediction,
+                    "prediction_coordinate_space": "global_image_pixels",
+                }
+                refinements.append(refinement)
+                if needs_fallback:
+                    fallback_branches.append(
+                        AddressedCrop(
+                            str(address_task["point_id"]),
+                            str(address_task["label"]),
+                            None,
+                            global_fallback_point_prompt(
+                                str(address_task["label"]),
+                                address_task["global_point"],
+                                width,
+                                height,
+                            ),
+                        )
+                    )
+                    fallback_tasks.append(
+                        {
+                            "address_task": address_task,
+                            "refinement_index": len(refinements) - 1,
+                        }
+                    )
+
+            fallback_execution = None
+            if fallback_branches:
+                fallback_decoded, fallback_execution = decoder.decode_image(
+                    image,
+                    fallback_branches,
+                    requested_wave_size=args.wave_size,
+                    allow_none=True,
+                )
+                if len(fallback_decoded) != len(fallback_tasks):
+                    raise RuntimeError(
+                        "Global fallback address/output count differs: "
+                        f"{len(fallback_decoded)} != {len(fallback_tasks)}"
+                    )
+                for fallback_task, result in zip(fallback_tasks, fallback_decoded):
+                    address_task = fallback_task["address_task"]
+                    prediction = parse_single_hbb(
+                        result["answer"], address_task["label"], width, height
+                    )
+                    accepted = bool(
+                        prediction is not None
+                        and point_inside_hbox(
+                            address_task["global_point"], prediction["hbox"]
+                        )
+                    )
+                    global_prediction = None
+                    if accepted:
+                        global_prediction = dict(prediction)
+                        global_prediction["point_id"] = address_task["point_id"]
+                        global_prediction["witness_point"] = address_task["global_point"]
+                        global_prediction["source"] = "pixel_pivr_global_fallback_pbd6"
+                        raw_predictions.append(global_prediction)
+                    refinements[fallback_task["refinement_index"]].update(
+                        {
+                            "global_fallback_result": result,
+                            "global_fallback_prediction": prediction,
+                            "global_fallback_accepted": accepted,
+                            "accepted": accepted,
+                            "prediction": global_prediction,
+                        }
+                    )
+                execution = {
+                    **execution,
+                    "local_pass": execution,
+                    "global_fallback_pass": fallback_execution,
+                    "global_fallback_addresses": len(fallback_branches),
+                    "model_seconds": float(execution["model_seconds"])
+                    + float(fallback_execution["model_seconds"]),
+                    "end_to_end_seconds": float(execution["end_to_end_seconds"])
+                    + float(fallback_execution["end_to_end_seconds"]),
+                    "peak_gpu_mb": max(
+                        float(execution["peak_gpu_mb"]),
+                        float(fallback_execution["peak_gpu_mb"]),
+                    ),
+                }
+            else:
+                execution["global_fallback_addresses"] = 0
             predictions = class_nms(raw_predictions, args.nms_iou)
             metric = None
             if task == "detection" and "gt" in row:
@@ -443,19 +615,28 @@ def run(args: argparse.Namespace) -> None:
                 )
 
     summary: dict[str, Any] = {
-        "schema_version": "pixel-pivr-standalone-inference-v1",
+        "schema_version": "pixel-pivr-standalone-inference-v2",
         "images": count_jsonl(predictions_path),
         "model": str(args.model.resolve()),
         "adapter": str(args.adapter.resolve()),
+        "allow_unsynchronized_adapter": bool(args.allow_unsynchronized_adapter),
         "wave_size": args.wave_size,
         "prefix_cache_mode": args.prefix_cache_mode,
+        "geometry_prefix_mode": args.geometry_prefix_mode,
         "crop_side": args.crop_side,
+        "local_resize_side": args.local_resize_side,
         "image_token_limit": args.image_token_limit,
         "visual_context": args.visual_context,
+        "point_address_prompt_schema": args.point_address_prompt_schema,
+        "global_fallback": bool(args.global_fallback),
+        "fallback_edge_margin": float(args.fallback_edge_margin),
         "magnified_roi_pixels": args.magnified_roi_pixels,
         "magnified_roi_stride": args.magnified_roi_stride,
+        "multiscale_roi_pixels": list(args.multiscale_roi_pixels),
+        "multiscale_target_patches": args.multiscale_target_patches,
         "prediction_cap": None,
         "nms_iou": args.nms_iou,
+        "seed": int(args.seed),
         "tasks": dict(sorted(tasks_seen.items())),
         "point_stage_seconds": total_point_seconds,
         "refinement_seconds": total_refinement_seconds,
@@ -502,27 +683,94 @@ def parse_args() -> argparse.Namespace:
         default="shared",
         help="Share one global Qwen KV prefix per image or recompute it per wave",
     )
+    parser.add_argument(
+        "--geometry-prefix-mode",
+        choices=("ref", "box_only"),
+        default="ref",
+        help=(
+            "Use legacy forced <ref> context or predict the PBD6 block directly "
+            "after the prompt. Magnified-v2 requires box_only."
+        ),
+    )
     parser.add_argument("--crop-side", type=int, default=384)
+    parser.add_argument(
+        "--local-resize-side",
+        type=int,
+        default=None,
+        help=(
+            "Resize each point-centred pixel crop to this square side before "
+            "MoonViT; predictions are mapped back through the inverse scale."
+        ),
+    )
     parser.add_argument("--image-token-limit", type=int, default=1024)
     parser.add_argument(
         "--visual-context",
-        choices=("pixel_reencoded", "preprojector_magnified_roi"),
+        choices=(
+            "pixel_reencoded",
+            "preprojector_magnified_roi",
+            ADAPTIVE_CONTEXT,
+        ),
         default="pixel_reencoded",
     )
     parser.add_argument("--magnified-roi-pixels", type=int, default=380)
     parser.add_argument(
         "--magnified-roi-stride", type=int, choices=(1, 2), default=1
     )
+    parser.add_argument(
+        "--multiscale-roi-pixels", type=parse_int_csv, default=(196, 378, 756)
+    )
+    parser.add_argument("--multiscale-target-patches", type=int, default=27)
+    parser.add_argument("--multiscale-fusion-hidden", type=int, default=128)
+    parser.add_argument("--multiscale-preferred-scale", type=int, default=1)
     parser.add_argument("--point-max-new-tokens", type=int, default=2048)
+    parser.add_argument(
+        "--point-address-prompt-schema",
+        choices=("compact", "legacy_two_image"),
+        default="compact",
+        help=(
+            "Round-2 language template. 'compact' matches current Pixel-PIVR "
+            "training; legacy_two_image is retained only for older adapters."
+        ),
+    )
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--nms-iou", type=float, default=0.5)
     parser.add_argument("--allow-none", action="store_true")
+    parser.add_argument(
+        "--global-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Retry local None/invalid/crop-edge outputs against the full image. "
+            "This is required by the magnified-v2 training contract."
+        ),
+    )
+    parser.add_argument(
+        "--fallback-edge-margin",
+        type=float,
+        default=2.0,
+        help="Local-view pixel margin treated as an incomplete crop boundary.",
+    )
     parser.add_argument("--allow-download", action="store_true")
+    parser.add_argument(
+        "--allow-unsynchronized-adapter",
+        action="store_true",
+        help="Permit a known-invalid legacy distributed adapter for diagnostics only.",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=10)
     args = parser.parse_args()
+    if args.global_fallback and not args.allow_none:
+        parser.error("--global-fallback requires --allow-none")
+    if args.global_fallback and args.visual_context != "pixel_reencoded":
+        parser.error("--global-fallback currently requires --visual-context pixel_reencoded")
+    if args.global_fallback and args.geometry_prefix_mode != "box_only":
+        parser.error("--global-fallback requires --geometry-prefix-mode box_only")
+    if args.global_fallback and not args.local_resize_side:
+        parser.error("--global-fallback requires an explicit --local-resize-side")
+    if not 0 <= args.multiscale_preferred_scale < len(args.multiscale_roi_pixels):
+        parser.error("--multiscale-preferred-scale is outside --multiscale-roi-pixels")
     for path in (args.model, args.adapter, args.manifest):
         if not path.exists() and not path.is_symlink():
             parser.error(f"Missing input: {path}")

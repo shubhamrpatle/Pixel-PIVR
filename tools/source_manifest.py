@@ -10,7 +10,18 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "MANIFEST.sha256"
-EXCLUDED_DIRECTORIES = {".git", ".cache", ".pytest_cache", "__pycache__", "runs", ".venv"}
+EXCLUDED_DIRECTORIES = {
+    ".git",
+    ".cache",
+    ".pytest_cache",
+    ".venv",
+    "__pycache__",
+    "checkpoints",
+    "data",
+    "outputs",
+    "runs",
+    "wandb",
+}
 
 
 def files() -> list[Path]:

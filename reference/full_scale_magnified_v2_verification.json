@@ -1,0 +1,133 @@
+{
+  "schema_version": "pixel-pivr-full-scale-release-verification-v1",
+  "status": "local_release_passed_remote_pending",
+  "architecture_contract": "pixel_crop_144to384_v2",
+  "dataset_schema": "pixel-pivr-hf-hbb-magnified-v2",
+  "dataset": {
+    "materialized_images": 124325,
+    "images_by_split": {
+      "test": 16712,
+      "train": 106613,
+      "validation": 1000
+    },
+    "image_bytes": 78946432518,
+    "image_hash_overlap": {
+      "train_test": 0,
+      "train_validation": 0,
+      "validation_test": 0
+    },
+    "full_image_sha256_verification": true,
+    "materialized_verification_sha256": "fc94ef6f8d6167ddf646dcb062b51c2aa038e0460b0455e30448fa260f20e704"
+  },
+  "magnified_local_view": {
+    "source_crop_side_pixels": 144,
+    "resize_side_pixels": 384,
+    "la_processor_aligned_side_pixels": 392,
+    "resample": "PIL.Image.Resampling.LANCZOS",
+    "projected_local_tokens": 196,
+    "answer_schema": "box-only PBD6 HBB or explicit None",
+    "fallback_edge_margin_pixels": 2.0
+  },
+  "training": {
+    "global_batch": 8,
+    "stage1": {
+      "records": 460263,
+      "padding_records": 1,
+      "one_pass_optimizer_steps": 57533,
+      "task_weights": {
+        "detection": 0.7291383319507668,
+        "grounding": 1.5084455882825496,
+        "pointing": 3.723870936422919
+      }
+    },
+    "stage2": {
+      "records": 2100576,
+      "padding_records": 0,
+      "one_pass_optimizer_steps": 262572,
+      "dense_records": 1960076,
+      "replay_records": 140500,
+      "record_level_replay_percent": 6.688641591639627,
+      "source_query_replay_percent": 22.106903967956434,
+      "task_weights": {
+        "detection": 0.48109537587403095,
+        "grounding": 12.8327118347174,
+        "pointing": 41.44701170063732
+      }
+    },
+    "validation_monitor_records": 2141,
+    "loss_balancing": "source_query_task"
+  },
+  "exact_loader_stress": {
+    "model_revision": "c32291ca5e996f5a7a485845b4f57a233936bba0",
+    "eagle_revision": "8442db3b79f7fd2357e468e6eecdd9b6a82049ff",
+    "annotation_shards": 50,
+    "records_checked": 156,
+    "records_skipped": 0,
+    "selection_sha256": "3ed50f913c3a809c0e7b5b24ce0e42e6f90f515f3dbd3499ee7fb5754672ce75",
+    "maximum_post_mtp_sequence_tokens": 20978,
+    "sequence_limit": 32768,
+    "supervised_tokens": 58323
+  },
+  "evaluation_contract": {
+    "detection": {
+      "DIOR": {
+        "records": 586,
+        "targets": 3379,
+        "classes": 20,
+        "ontology": "dior_raw_20_class",
+        "keeps_overpass_distinct": true
+      },
+      "DOTAv2": {
+        "records": 874,
+        "targets": 29329,
+        "classes": 18,
+        "ontology": "dotav2_raw_18_class",
+        "keeps_plane_and_vehicle_sizes_distinct": true
+      },
+      "matching": "uncapped class-aware one-to-one IoU@0.5"
+    },
+    "grounding": {
+      "DIOR-RSVG": 7500,
+      "VRSBench-VG_leakage_controlled": 16154,
+      "VRSBench-VG_excluded_hash_overlaps": 5
+    },
+    "pointing": {
+      "DOTAv2-Balanced100_records": 285,
+      "DOTAv2-Balanced100_targets": 9045,
+      "scope": "diagnostic"
+    },
+    "benchmark_images_used_for_training_or_validation": 0
+  },
+  "execution_safety": {
+    "checkpoint_schema": "pixel-pivr-lora-checkpoint-v5",
+    "completion_schema": "pixel-pivr-done-v3",
+    "run_contract_schema": "pixel-pivr-run-contract-v5",
+    "scheduled_annotation_checksums_verified_each_launch": true,
+    "checksum_ledger_sha256": "8b9e4b89fd9cd6c7a32cfa91f03d2e67f2be5185d838bffa3962cdfa1b804edb",
+    "scheduled_annotation_files": 47,
+    "scheduled_train_and_monitor_records": 2562980,
+    "exact_resume_includes": [
+      "LoRA state",
+      "optimizer state",
+      "scheduler state",
+      "per-rank RNG state",
+      "global exposure cursor",
+      "signed data and hyperparameter contract"
+    ],
+    "stage2_initialization": "stage1_best_validation_loss_adapter_with_fresh_optimizer",
+    "full_scale_operator_lock": "FULL_SCALE_APPROVED=YES",
+    "required_gpu_processes": 8
+  },
+  "hub_bundle": {
+    "repository": "shubhampatle/Pixel-PIVR-Magnified-v2",
+    "remote_revision": null,
+    "remote_verification": "pending",
+    "archives": 20,
+    "physical_upload_files": 85,
+    "archive_member_sha256_verification": true,
+    "bundle_manifest_sha256": "1abf87b7e2b79276630c74a7dd9b3ebb76ccbeb7abc425885869f43e7a490f9e",
+    "bundle_verification_sha256": "867846143a042ae92ab18c3700f4fbf4d33246b686324c381825fa10fcb10f6d",
+    "full_roundtrip_materialization_passed": true,
+    "roundtrip_materialization_report_sha256": "c39258cdc52b05c11dc10ec421bf2ff6eca7540bf11f393fbd7782d018dd1667"
+  }
+}

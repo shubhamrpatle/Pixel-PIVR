@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import unittest
 
-from pixel_pivr.decoder import image_patch_lengths
+from pixel_pivr.decoder import AddressedCrop, PixelPIVRWaveDecoder, image_patch_lengths
 from pixel_pivr.shared_prefix import SharedPrefixCache
 
 
@@ -30,3 +30,19 @@ class DecoderContractTests(unittest.TestCase):
         self.assertEqual(cache.layers[0].prefix_keys.data_ptr(), pointer)
         self.assertEqual(tuple(keys.shape), (5, 2, 5, 4))
         self.assertEqual(tuple(values.shape), (5, 2, 5, 4))
+
+    def test_box_only_geometry_starts_from_prompt_final_token(self) -> None:
+        decoder = object.__new__(PixelPIVRWaveDecoder)
+        decoder.geometry_prefix_mode = "box_only"
+        decoder.n_future_tokens = 6
+        decoder.mask_id = 99
+        branches = [AddressedCrop("a1", "ship", None, "prompt")]
+        ids, attention = decoder._prepare_geometry_inputs(
+            branches,
+            input_dtype=torch.long,
+            attention_dtype=torch.long,
+            device=torch.device("cpu"),
+            prompt_last_ids=torch.tensor([17]),
+        )
+        self.assertEqual(ids.tolist(), [[17, 99, 99, 99, 99, 99]])
+        self.assertEqual(attention.tolist(), [[1, 1, 1, 1, 1, 1]])

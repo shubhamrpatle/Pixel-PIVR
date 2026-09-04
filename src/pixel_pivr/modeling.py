@@ -37,6 +37,20 @@ def chunked_cross_entropy(
     return total / shifted_labels.numel()
 
 
+def weighted_training_objective(
+    native: torch.Tensor, sample: Mapping[str, Any]
+) -> tuple[torch.Tensor, dict[str, float]]:
+    weight = float(sample.get("pixel_pivr_loss_weight", 1.0))
+    if not 0.0 < weight < float("inf"):
+        raise ValueError(f"Invalid Pixel-PIVR loss weight: {weight}")
+    objective = native * weight
+    return objective, {
+        "loss": float(objective.detach().float()),
+        "native_loss": float(native.detach().float()),
+        "loss_weight": weight,
+    }
+
+
 class PixelPIVRTrainingModel(nn.Module):
     """Frozen vision/projector plus trainable Qwen LoRA and native MTP loss."""
 
@@ -94,8 +108,4 @@ class PixelPIVRTrainingModel(nn.Module):
         native = chunked_cross_entropy(
             outputs.last_hidden_state, labels, causal.lm_head.weight
         )
-        return native, {
-            "loss": float(native.detach().float()),
-            "native_loss": float(native.detach().float()),
-        }
-
+        return weighted_training_objective(native, sample)
