@@ -32,7 +32,9 @@ def files() -> list[Path]:
             continue
         if any(part in EXCLUDED_DIRECTORIES for part in relative.parts):
             continue
-        if path.suffix == ".pyc" or (relative.parts[0] == "configs" and path.suffix == ".env"):
+        if path.suffix in {".log", ".pyc"} or (
+            relative.parts[0] == "configs" and path.suffix == ".env"
+        ):
             continue
         output.append(path)
     return sorted(output, key=lambda value: value.relative_to(ROOT).as_posix())

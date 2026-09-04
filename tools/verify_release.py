@@ -56,6 +56,7 @@ def main() -> None:
         ROOT / "tools/build_asset_manifest.py",
         ROOT / "tools/preflight.py",
         ROOT / "tools/prepare_evaluation.py",
+        ROOT / "tools/prepare_dotav2_balanced100.py",
         ROOT / "tools/source_manifest.py",
         ROOT / "tools/build_hf_upload_bundle.py",
         ROOT / "tools/materialize_hf_dataset.py",

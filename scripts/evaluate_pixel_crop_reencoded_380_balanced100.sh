@@ -55,6 +55,7 @@ verify() {
     "$CROP_DATASET/manifest.json" "$PREPARED_DATASET/manifest.json" "$CROP_SIDE" <<'PY'
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 
 done_path, adapter, eval_manifest, crop_manifest, compact_manifest = map(
@@ -78,6 +79,15 @@ rows = [json.loads(line) for line in eval_manifest.read_text(encoding="utf-8").s
 assert len(rows) == 100
 assert len({row["sample_key"] for row in rows}) == 100
 assert sum(len(row.get("gt") or []) for row in rows) == 9045
+labels = Counter(target["label"] for row in rows for target in row.get("gt") or [])
+for label, expected in {"small vehicle": 5650, "large vehicle": 108, "plane": 73}.items():
+    assert labels[label] == expected, (
+        f"evaluation manifest has an invalid {label!r} count: "
+        f"{labels[label]} != {expected}"
+    )
+assert labels["vehicle"] == 0 and labels["airplane"] == 0, (
+    "evaluation manifest contains collapsed DOTAv2 labels"
+)
 
 checkpoint = __import__("torch").load(adapter, map_location="cpu", weights_only=False)
 config = checkpoint.get("config") or {}

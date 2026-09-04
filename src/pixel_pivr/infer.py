@@ -29,6 +29,7 @@ from .geometry import (
     local_hbox_to_global,
     parse_labeled_points,
     parse_single_hbb,
+    pilot_compact_point_prompt,
     point_address_prompt,
     point_centered_crop,
     point_inside_hbox,
@@ -342,7 +343,9 @@ def run(args: argparse.Namespace) -> None:
             branches: list[AddressedCrop] = []
             tasks: list[dict[str, Any]] = []
             for point in points:
-                if args.point_address_prompt_schema == "compact":
+                if args.point_address_prompt_schema == "pilot_compact_ref":
+                    point_prompt = pilot_compact_point_prompt
+                elif args.point_address_prompt_schema == "compact":
                     point_prompt = cached_feature_point_prompt
                 else:
                     point_prompt = point_address_prompt
@@ -725,11 +728,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--point-max-new-tokens", type=int, default=2048)
     parser.add_argument(
         "--point-address-prompt-schema",
-        choices=("compact", "legacy_two_image"),
+        choices=("compact", "pilot_compact_ref", "legacy_two_image"),
         default="compact",
         help=(
-            "Round-2 language template. 'compact' matches current Pixel-PIVR "
-            "training; legacy_two_image is retained only for older adapters."
+            "Round-2 language template. 'compact' matches Magnified-v2; "
+            "pilot_compact_ref matches the synchronized 16K/4K pilot exactly; "
+            "legacy_two_image is retained only for older adapters."
         ),
     )
     parser.add_argument("--temperature", type=float, default=0.7)

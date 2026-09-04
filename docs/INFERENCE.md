@@ -49,6 +49,23 @@ accepted, but generic `vehicle` is not assigned to either vehicle subclass.
 Preflight reconstructs both detection manifests and rejects missing, collapsed,
 unknown, or inconsistently prompted labels.
 
+### Frozen DOTAv2 pilot evaluation
+
+The synchronized 16K/4K pixel-crop pilot has a separate, frozen evaluation
+contract. Run `tools/prepare_dotav2_balanced100.py` through
+`scripts/evaluate_pixel_crop_magnified_144to384_balanced100.sh`; do not reuse a
+historical generated manifest. The builder requires `raw_class_name`, preserves
+all 18 DOTAv2 classes, and fails unless the 100 images contain exactly 9,045 GT
+boxes with the signed per-class distribution. In particular, it rejects the
+lossy `small vehicle`/`large vehicle` to `vehicle` and `plane` to `airplane`
+collapses that corrupted the earlier class-aware score.
+
+The pilot adapter was trained with the exact Round-2 template selected by
+`--point-address-prompt-schema pilot_compact_ref`. The default `compact` schema
+belongs to full-scale Magnified-v2 and is intentionally different. Keeping both
+names explicit prevents evaluation-time prompt drift while preserving backward
+compatibility.
+
 The release mode is `--visual-context pixel_reencoded --crop-side 144
 --local-resize-side 384`. Each point receives a real 144 x 144 source-pixel crop
 resized to 384 x 384. The local PBD6 box is decoded in the local frame and mapped

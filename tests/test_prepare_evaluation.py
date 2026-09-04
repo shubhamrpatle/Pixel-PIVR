@@ -6,10 +6,105 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from pixel_pivr.infer import row_class_prompts, row_label
+from tools.prepare_dotav2_balanced100 import (
+    balanced100_rows,
+    validate_balanced100_rows,
+)
 from tools.prepare_evaluation import DIOR_CLASSES, DOTA_CLASSES, detection_rows
 
 
 class PrepareEvaluationTests(unittest.TestCase):
+    def test_balanced100_builder_requires_and_preserves_raw_labels(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            image_root = root / "images"
+            image_root.mkdir()
+            (image_root / "example.png").write_bytes(b"test image placeholder")
+            source = root / "balanced100.jsonl"
+            source.write_text(
+                json.dumps(
+                    {
+                        "image_id": "example",
+                        "image_path": "example.png",
+                        "objects": [
+                            {
+                                "raw_class_name": "plane",
+                                "class_name": "airplane",
+                                "hbox": [1, 2, 3, 4],
+                            },
+                            {
+                                "raw_class_name": "small vehicle",
+                                "class_name": "vehicle",
+                                "hbox": [5, 6, 7, 8],
+                            },
+                            {
+                                "raw_class_name": "large vehicle",
+                                "class_name": "vehicle",
+                                "hbox": [9, 10, 11, 12],
+                            },
+                        ],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            values = balanced100_rows([source], image_root)
+
+        counts = validate_balanced100_rows(
+            values,
+            expected_images=1,
+            expected_class_counts={
+                "plane": 1,
+                "small vehicle": 1,
+                "large vehicle": 1,
+            },
+        )
+        self.assertEqual(
+            [target["label"] for target in values[0]["gt"]],
+            ["plane", "small vehicle", "large vehicle"],
+        )
+        self.assertEqual(values[0]["class_ontology"], "dotav2_raw_18_class")
+        self.assertEqual(values[0]["gt_label_field"], "raw_class_name")
+        self.assertNotIn("vehicle", counts)
+        self.assertNotIn("airplane", counts)
+
+    def test_balanced100_builder_fails_without_raw_label(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            image_root = root / "images"
+            image_root.mkdir()
+            (image_root / "example.png").write_bytes(b"test image placeholder")
+            source = root / "balanced100.jsonl"
+            source.write_text(
+                json.dumps(
+                    {
+                        "image_id": "example",
+                        "image_path": "example.png",
+                        "objects": [
+                            {"class_name": "vehicle", "hbox": [1, 2, 3, 4]}
+                        ],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "missing raw_class_name"):
+                balanced100_rows([source], image_root)
+
+    def test_balanced100_validation_rejects_collapsed_labels(self) -> None:
+        values = [
+            {
+                "sample_key": "DOTAv2:balanced100:bad",
+                "gt": [{"label": "vehicle", "hbox": [1, 2, 3, 4]}],
+            }
+        ]
+        with self.assertRaisesRegex(ValueError, "Collapsed DOTAv2 labels"):
+            validate_balanced100_rows(
+                values,
+                expected_images=1,
+                expected_class_counts={"vehicle": 1},
+            )
+
     def test_dotav2_preserves_raw_18_class_ontology(self) -> None:
         with TemporaryDirectory() as directory:
             source = Path(directory) / "part-00000.jsonl"

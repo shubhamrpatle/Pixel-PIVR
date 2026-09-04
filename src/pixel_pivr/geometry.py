@@ -85,12 +85,23 @@ def point_address_prompt(
 def cached_feature_point_prompt(
     label: str, point: Sequence[float], width: int, height: int
 ) -> str:
-    """Training-matched local-completeness prompt for pixel re-encoding."""
+    """Magnified-v2 local-completeness prompt for pixel re-encoding."""
     x, y = point_to_norm(point, width, height)
     return (
         f"Locate the single {label} containing point <box><{x}><{y}></box> "
         "in the local view. Return its complete horizontal box, or None if "
         "the complete boundary is unavailable."
+    )
+
+
+def pilot_compact_point_prompt(
+    label: str, point: Sequence[float], width: int, height: int
+) -> str:
+    """Exact Round-2 prompt used by the synchronized 16K/4K pilot."""
+    x, y = point_to_norm(point, width, height)
+    return (
+        f"Locate the single {label} containing point <box><{x}><{y}></box> "
+        "in horizontal box format. Return None if absent."
     )
 
 

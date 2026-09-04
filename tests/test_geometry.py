@@ -8,6 +8,7 @@ from pixel_pivr.geometry import (
     class_nms,
     detection_counts,
     global_fallback_point_prompt,
+    pilot_compact_point_prompt,
     parse_labeled_points,
     parse_single_hbb,
     point_centered_crop,
@@ -23,6 +24,11 @@ class GeometryTests(unittest.TestCase):
             "Locate the single small vehicle containing point "
             "<box><500><500></box> in the local view. Return its complete "
             "horizontal box, or None if the complete boundary is unavailable.",
+        )
+        self.assertEqual(
+            pilot_compact_point_prompt("small vehicle", [72, 72], 144, 144),
+            "Locate the single small vehicle containing point "
+            "<box><500><500></box> in horizontal box format. Return None if absent.",
         )
         self.assertEqual(
             global_fallback_point_prompt("small vehicle", [512, 256], 1024, 1024),

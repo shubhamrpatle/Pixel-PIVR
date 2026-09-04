@@ -11,11 +11,15 @@ set -a
 source "$RUN_CONFIG"
 set +a
 
+EVAL_OUTPUT="${EVAL_OUTPUT_OVERRIDE:-$EVAL_OUTPUT}"
+EVAL_ANNOTATION="${EVAL_ANNOTATION:-$DATA_ROOT/Zero_shot_ anlysis_LA/dataset/eval_balanced100/DOTAv2/annotations/DOTAv2_balanced100.jsonl}"
+EVAL_IMAGE_ROOT="${EVAL_IMAGE_ROOT:-$DATA_ROOT/Zero_shot_ anlysis_LA/dataset/eval_balanced100/DOTAv2/images}"
+EVAL_MANIFEST="${EVAL_MANIFEST_OVERRIDE:-$EVAL_OUTPUT/assets/DOTAv2_balanced100_raw_labels.jsonl}"
 ADAPTER="${EVAL_ADAPTER:-$OUTPUT_DIR/best.pt}"
 IFS=',' read -r -a GPUS <<< "$EVAL_GPU_IDS"
 (( ${#GPUS[@]} >= 2 )) || { echo "EVAL_GPU_IDS requires two GPUs" >&2; exit 2; }
 export PYTHONPATH="$ROOT/src:$EAGLE_ROOT:${PYTHONPATH:-}"
-mkdir -p "$EVAL_OUTPUT/logs"
+mkdir -p "$EVAL_OUTPUT/logs" "$(dirname "$EVAL_MANIFEST")"
 
 gpu_uuid() {
   nvidia-smi --query-gpu=index,uuid --format=csv,noheader,nounits |
@@ -33,15 +37,25 @@ require_gpu_free() {
   fi
 }
 
+prepare_manifest() {
+  "$PYTHON_BIN" "$ROOT/tools/prepare_dotav2_balanced100.py" \
+    --annotation "$EVAL_ANNOTATION" \
+    --image-root "$EVAL_IMAGE_ROOT" \
+    --output "$EVAL_MANIFEST"
+}
+
 verify() {
+  prepare_manifest
   for path in "$PYTHON_BIN" "$MODEL_PATH" "$EAGLE_ROOT" "$ADAPTER" \
-    "$EVAL_MANIFEST" "$CROP_DATASET/manifest.json" "$PREPARED_DATASET/manifest.json" \
+    "$EVAL_ANNOTATION" "$EVAL_IMAGE_ROOT" "$EVAL_MANIFEST" \
+    "$CROP_DATASET/manifest.json" "$PREPARED_DATASET/manifest.json" \
     "$OUTPUT_DIR/done.json"; do
     [[ -e "$path" ]] || { echo "Missing evaluation input: $path" >&2; exit 2; }
   done
   "$PYTHON_BIN" - "$OUTPUT_DIR/done.json" "$ADAPTER" "$EVAL_MANIFEST" \
     "$CROP_DATASET/manifest.json" <<'PY'
 import json, sys
+from collections import Counter
 from pathlib import Path
 done_path, adapter, eval_manifest, crop_manifest = map(Path, sys.argv[1:])
 done = json.loads(done_path.read_text())
@@ -53,6 +67,11 @@ assert crop["crop_side"] == 144 and crop["output_side"] == 384
 rows = [json.loads(line) for line in eval_manifest.read_text().splitlines() if line]
 assert len(rows) == 100 and len({row["sample_key"] for row in rows}) == 100
 assert sum(len(row.get("gt") or []) for row in rows) == 9045
+labels = Counter(target["label"] for row in rows for target in row["gt"])
+assert labels["small vehicle"] == 5650
+assert labels["large vehicle"] == 108
+assert labels["plane"] == 73
+assert labels["vehicle"] == 0 and labels["airplane"] == 0
 checkpoint = __import__("torch").load(adapter, map_location="cpu", weights_only=False)
 config = checkpoint.get("config") or {}
 assert config.get("visual_context") == "pixel_reencoded"
@@ -85,7 +104,7 @@ run_arm() {
     --prefix-cache-mode shared \
     --image-token-limit 6000 \
     --visual-context pixel_reencoded \
-    --point-address-prompt-schema compact \
+    --point-address-prompt-schema pilot_compact_ref \
     --crop-side 144 \
     --local-resize-side 384 \
     --point-max-new-tokens 4096 \
@@ -115,7 +134,7 @@ for name in ("sequential", "wave200"):
     row = json.loads((root / name / "summary.json").read_text())
     assert row["images"] == 100 and row["prediction_cap"] is None
     assert row["crop_side"] == 144 and row["local_resize_side"] == 384
-    assert row["point_address_prompt_schema"] == "compact"
+    assert row["point_address_prompt_schema"] == "pilot_compact_ref"
     payload["arms"][name] = row
     prediction_rows[name] = [
         json.loads(line)
