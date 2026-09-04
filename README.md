@@ -54,6 +54,8 @@ This repository is the reproducible HBB Magnified-v2 release.
 | Item | Contract |
 |---|---|
 | Base model | `nvidia/LocateAnything-3B` |
+| Dataset | [`shubhampatle/Pixel-PIVR-Magnified-v2`](https://huggingface.co/datasets/shubhampatle/Pixel-PIVR-Magnified-v2) |
+| Pinned dataset revision | `5be1a40c776b494a9ae6ec472b7c611aa9027698` |
 | Tasks | HBB detection, phrase grounding, pointing |
 | Coordinates | Integer-normalized `[0, 1000]` |
 | Trainable parameters | Rank-16 LoRA modules inside Qwen |
@@ -195,21 +197,65 @@ configuration and is not the released experiment contract.
 
 ## 2. Clone and Pin the Code
 
-Use an immutable 40-character commit supplied for the experiment. Do not train
-from a moving `main` branch.
+Use one parent directory on a high-capacity filesystem. The following layout
+keeps source code, downloaded assets, and generated checkpoints separate:
 
-```bash
-export CODE_ROOT=/absolute/path/to/Pixel-PIVR
-export CODE_REVISION="REPLACE_WITH_VERIFIED_40_CHARACTER_GITHUB_COMMIT"
-
-git clone https://github.com/shubhamrpatle/Pixel-PIVR.git "$CODE_ROOT"
-git -C "$CODE_ROOT" checkout --detach "$CODE_REVISION"
-test "$(git -C "$CODE_ROOT" rev-parse HEAD)" = "$CODE_REVISION"
-cd "$CODE_ROOT"
+```text
+$PIXEL_PIVR_HOME/
+|-- Pixel-PIVR/                         Git checkout and local .venv
+|-- assets/
+|   |-- Eagle/                          pinned and patched Eagle checkout
+|   |-- LocateAnything-3B/              pinned base-model snapshot
+|   |-- Pixel-PIVR-Magnified-v2/        Hub files plus materialized images
+|   `-- download_receipt.json           immutable download identities
+`-- runs/
+    `-- magnified-v2/                   Stage 1, Stage 2, and evaluation outputs
 ```
 
-The exported shell variables are not persistent across new SSH logins. Re-export
-the same absolute paths in each new shell before running later commands.
+Set `PIXEL_PIVR_HOME` to a real absolute path with at least 180 GiB free for
+assets. Keep `RUN_ROOT` on a filesystem with at least 100 GiB free. They may be
+different filesystems when needed.
+
+```bash
+export PIXEL_PIVR_HOME=/absolute/high-capacity/path/pixel-pivr
+export CODE_ROOT="$PIXEL_PIVR_HOME/Pixel-PIVR"
+export WORK_ROOT="$PIXEL_PIVR_HOME/assets"
+export RUN_ROOT="$PIXEL_PIVR_HOME/runs/magnified-v2"
+export VENV="$CODE_ROOT/.venv"
+
+mkdir -p "$PIXEL_PIVR_HOME" "$WORK_ROOT" "$RUN_ROOT"
+git clone https://github.com/shubhamrpatle/Pixel-PIVR.git "$CODE_ROOT"
+cd "$CODE_ROOT"
+
+# Resolve the cloned release to an immutable identity and detach from main.
+export CODE_REVISION="$(git rev-parse HEAD)"
+git checkout --detach "$CODE_REVISION"
+test "$(git rev-parse HEAD)" = "$CODE_REVISION"
+printf 'CODE_REVISION=%s\n' "$CODE_REVISION"
+```
+
+Record the printed 40-character `CODE_REVISION` with the experiment. For a
+published result, all machines must check out the same recorded commit instead
+of resolving `main` independently.
+
+The exported shell variables are not persistent across new SSH logins. Put the
+following block at the beginning of every later shell, changing only the first
+line to the path selected above:
+
+```bash
+export PIXEL_PIVR_HOME=/absolute/high-capacity/path/pixel-pivr
+export CODE_ROOT="$PIXEL_PIVR_HOME/Pixel-PIVR"
+export WORK_ROOT="$PIXEL_PIVR_HOME/assets"
+export RUN_ROOT="$PIXEL_PIVR_HOME/runs/magnified-v2"
+export VENV="$CODE_ROOT/.venv"
+export PIPELINE_CONFIG="$CODE_ROOT/configs/full_scale.env"
+export DATA_REPO=shubhampatle/Pixel-PIVR-Magnified-v2
+export DATA_REVISION=5be1a40c776b494a9ae6ec472b7c611aa9027698
+export MODEL_REPO=nvidia/LocateAnything-3B
+export MODEL_REVISION=c32291ca5e996f5a7a485845b4f57a233936bba0
+export EAGLE_REVISION=8442db3b79f7fd2357e468e6eecdd9b6a82049ff
+cd "$CODE_ROOT"
+```
 
 ## 3. Install the Tested Environment
 
@@ -218,8 +264,9 @@ CUDA 12.1 PyTorch, Transformers, PEFT, training dependencies, tests, and
 FlashAttention 2.
 
 ```bash
-export WORK_ROOT=/absolute/path/to/pixel-pivr-assets
-export VENV="$CODE_ROOT/.venv"
+: "${CODE_ROOT:?Run the path-export block from Section 2 first}"
+: "${WORK_ROOT:?Run the path-export block from Section 2 first}"
+: "${VENV:?Run the path-export block from Section 2 first}"
 export FLASH_ATTN_MAX_JOBS=16
 
 bash scripts/bootstrap_machine.sh install
@@ -261,19 +308,43 @@ The trainer always writes local JSONL curves even when W&B is disabled.
 
 ## 5. Download and Verify Model, Code Dependency, and Data
 
-Use only an owner-verified immutable Hugging Face dataset revision. Do not use
-`main` as `DATA_REVISION`.
+The public dataset is hosted at
+[`shubhampatle/Pixel-PIVR-Magnified-v2`](https://huggingface.co/datasets/shubhampatle/Pixel-PIVR-Magnified-v2).
+The commands below pin the verified snapshot used by this guide. Do not replace
+it with `main`, because a moving revision makes resume and result reproduction
+ambiguous.
 
 ```bash
 export DATA_REPO=shubhampatle/Pixel-PIVR-Magnified-v2
-export DATA_REVISION="REPLACE_WITH_VERIFIED_40_CHARACTER_HF_COMMIT"
+export DATA_REVISION=5be1a40c776b494a9ae6ec472b7c611aa9027698
 export MODEL_REPO=nvidia/LocateAnything-3B
 export MODEL_REVISION=c32291ca5e996f5a7a485845b4f57a233936bba0
 export EAGLE_REVISION=8442db3b79f7fd2357e468e6eecdd9b6a82049ff
+export DATA_DIR="$WORK_ROOT/Pixel-PIVR-Magnified-v2"
+export MODEL_DIR="$WORK_ROOT/LocateAnything-3B"
+export EAGLE_DIR="$WORK_ROOT/Eagle"
 export HF_XET_HIGH_PERFORMANCE=1
 
 bash scripts/bootstrap_machine.sh download
 ```
+
+The bootstrap invokes the equivalent dataset transfer with an absolute local
+directory:
+
+```bash
+"$VENV/bin/hf" download "$DATA_REPO" \
+  --repo-type dataset \
+  --revision "$DATA_REVISION" \
+  --local-dir "$DATA_DIR" \
+  --max-workers 32
+```
+
+Do **not** run only this lower-level command for a training machine. The Hub
+stores images in deterministic tar shards under `archives/`; JSONL records point
+to the logical `images/...` paths. The guarded bootstrap continues by validating
+all archive members, extracting the images atomically into `images/`, checking
+every materialized image hash, downloading the model, preparing Eagle, and
+writing the receipt required by preflight.
 
 This single command:
 
@@ -295,35 +366,70 @@ Run explicit verification again at any time:
 ```bash
 bash scripts/bootstrap_machine.sh verify-bundle
 bash scripts/bootstrap_machine.sh verify-data
+python -m json.tool "$WORK_ROOT/download_receipt.json"
 ```
 
-After materialization, the important paths are:
+After successful materialization, the on-disk layout is:
 
 ```text
-$WORK_ROOT/LocateAnything-3B/
-$WORK_ROOT/Eagle/Embodied/
-$WORK_ROOT/Pixel-PIVR-Magnified-v2/manifest.json
-$WORK_ROOT/Pixel-PIVR-Magnified-v2/SHA256SUMS
-$WORK_ROOT/Pixel-PIVR-Magnified-v2/recipes/
-$WORK_ROOT/Pixel-PIVR-Magnified-v2/annotations/
-$WORK_ROOT/Pixel-PIVR-Magnified-v2/images/
-$WORK_ROOT/download_receipt.json
+$WORK_ROOT/
+|-- LocateAnything-3B/                  model config, tokenizer, and weights
+|-- Eagle/
+|   `-- Embodied/                       patched LocateAnything training code
+|-- Pixel-PIVR-Magnified-v2/
+|   |-- manifest.json                   authoritative counts and contracts
+|   |-- SHA256SUMS                      package and logical-image checksums
+|   |-- recipes/                        frozen Stage 1/Stage 2/validation lists
+|   |-- annotations/                    train, validation, and test JSONL shards
+|   |-- archives/                       20 downloaded image tar shards
+|   `-- images/                         124,325 materialized train/val/test images
+`-- download_receipt.json               exact repo, revision, and local paths
+```
+
+Confirm that the expected roots exist before generating a training config:
+
+```bash
+test -f "$DATA_DIR/manifest.json"
+test -f "$DATA_DIR/recipes/stage1_coarse.json"
+test -f "$DATA_DIR/recipes/stage2_dense_balanced.json"
+test -d "$DATA_DIR/images"
+test -f "$MODEL_DIR/config.json"
+test -d "$EAGLE_DIR/Embodied"
+du -sh "$DATA_DIR" "$MODEL_DIR" "$EAGLE_DIR"
 ```
 
 ## 6. Generate the Node-Specific Configuration
 
-Choose an empty run directory on a filesystem with enough checkpoint space.
-The helper copies the frozen template and fills every absolute path and revision.
+Use the `WORK_ROOT` and `RUN_ROOT` selected in Section 2. The helper copies the
+frozen template and writes the exact absolute model, Eagle, dataset, run, code,
+and revision values. It refuses to overwrite an existing config unless a new
+run is explicitly requested with `FORCE=1`.
 
 ```bash
-export RUN_ROOT=/absolute/path/to/pixel-pivr-runs/magnified-v2
 export PIPELINE_CONFIG="$CODE_ROOT/configs/full_scale.env"
+mkdir -p "$RUN_ROOT"
 
 DATA_REVISION="$DATA_REVISION" \
   bash scripts/configure_a100_node.sh
 
 sed -n '1,220p' "$PIPELINE_CONFIG"
+grep -E '^(MODEL_PATH|EAGLE_ROOT|DATA_ROOT|RUN_ROOT|DATA_REVISION)=' \
+  "$PIPELINE_CONFIG"
 ```
+
+The generated path mapping must be:
+
+```text
+MODEL_PATH=$WORK_ROOT/LocateAnything-3B
+EAGLE_ROOT=$WORK_ROOT/Eagle/Embodied
+DATA_ROOT=$WORK_ROOT/Pixel-PIVR-Magnified-v2
+RUN_ROOT=<the absolute run path exported in Section 2>
+DATA_REVISION=5be1a40c776b494a9ae6ec472b7c611aa9027698
+```
+
+The actual config contains expanded absolute paths rather than the shell
+variables shown above. If any path differs from the directory tree in Section
+5, stop and correct the exported roots before preflight.
 
 The generated config starts with `FULL_SCALE_APPROVED=NO`. Confirm at least:
 
