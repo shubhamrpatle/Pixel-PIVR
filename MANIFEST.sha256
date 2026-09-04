@@ -1,5 +1,5 @@
 8027a464c00d4005bc69a5e5515c5e652909ca2dd1be4912600736a20e8bacd3  ./.gitignore
-81b792924de5560121d695134ca30adf799d0684fb7f9d1164086bd1f4bc43b7  ./README.md
+221ecd2877980aef457e5c555e62d096ac1be94bdd03a84ab195891ff0fbe8f3  ./README.md
 233a08a65786f100aed7d6a29f28a53f3de5186c7aeb00bef929c620d601a25a  ./configs/adaptive_multiscale_16k.env.example
 7900ed292c2d6666e1dd999d80df2597de76c22221afc20b4513c7e6f94f272b  ./configs/full_scale.env.example
 5ff3c06dd0d64620a698ff82f6ac6ea1b81cc996043b6895b41aa557db8389b4  ./configs/large_scale.env.example
